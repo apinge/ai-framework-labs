@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-极简 MLP 张量并行示例，接口风格对齐 sglang Qwen2MoeMLP（ColumnParallel gate_up + RowParallel down + SiLU*gate）。
+极简 MLP 张量并行示例：类名与 vLLM/sglang 的 Qwen2MoeMLP 对齐（ColumnParallel gate_up + RowParallel down + SiLU*gate）。
 
 命令行示例（AMD 可把 CUDA_VISIBLE_DEVICES 换成 HIP_VISIBLE_DEVICES）:
 
@@ -123,7 +123,7 @@ class RowParallelLinear(nn.Module):
         tp_rank: int,
         tp_size: int,
         device: torch.device,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
         if input_size % tp_size != 0:
@@ -146,9 +146,9 @@ class RowParallelLinear(nn.Module):
         return y, None
 
 
-class SimpleMlpTP(nn.Module):
+class Qwen2MoeMLP(nn.Module):
     """
-    与 Qwen2MoeMLP 类似的构造/前向签名（去掉 quant、prefix 等与并行无关的细节）。
+    与 vLLM `Qwen2MoeMLP` 类似的构造/前向（去掉 quant、expert_gate、prefix 等与并行无关的细节）。
     """
 
     def __init__(
@@ -161,7 +161,7 @@ class SimpleMlpTP(nn.Module):
         tp_rank: int = 0,
         tp_size: int = 1,
         device: Optional[torch.device] = None,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
         dev = device or torch.device("cuda")
@@ -196,6 +196,17 @@ class SimpleMlpTP(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        """
+        def forward(self, x):
+            gate_up, _ = self.gate_up_proj(x)
+            out = self.act_fn(gate_up)
+            out, _ = self.down_proj(out)
+
+            # if self.expert_gate is not None:
+            #     out = F.sigmoid(self.expert_gate(x)[0]) * out
+
+            return out
+        """
         gr = dist.get_rank() if dist.is_initialized() else 0
         if MLP_TP_LOG_SHAPES:
             print(f"[rank={gr} tp={self.tp_rank}/{self.tp_size}] x {tuple(x.shape)}")
@@ -226,8 +237,9 @@ class SimpleMlpTP(nn.Module):
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--batch", type=int, default=4)
-    p.add_argument("--hidden", type=int, default=4096)
-    p.add_argument("--inter", type=int, default=256)
+    # 与 HuggingFace Qwen/Qwen3.5-27B 的 text_config 一致（config.json）
+    p.add_argument("--hidden", type=int, default=5120)
+    p.add_argument("--inter", type=int, default=17408)
     args = p.parse_args()
 
     rank, world_size, device = _init_dist()
@@ -245,7 +257,7 @@ def main() -> None:
             f"intermediate_size={inter} 必须能被 tp_size={tp_size} 整除。"
         )
 
-    m = SimpleMlpTP(
+    m = Qwen2MoeMLP(
         h,
         inter,
         "silu",
@@ -258,7 +270,7 @@ def main() -> None:
     x = torch.randn(b, h, device=device, dtype=torch.float32)
     y = m(x)
     if rank == 0:
-        print(f"SimpleMlpTP 前向完成: x.shape={tuple(x.shape)} -> y.shape={tuple(y.shape)}")
+        print(f"Qwen2MoeMLP 前向完成: x.shape={tuple(x.shape)} -> y.shape={tuple(y.shape)}")
 
     if dist.is_initialized():
         dist.destroy_process_group()
