@@ -15,7 +15,7 @@ Torch golden（expert 体，**不含 router**）：[`torch_moe_golden.py`](torch
 
 ## 1. 符号
 
-| 符号 | 含义 | 你的取值 |
+| 符号 | 含义 | 取值 |
 |------|------|----------|
 | $M$ | token 数 | 1024 |
 | $K$ | hidden 维 | 4096 |
@@ -30,8 +30,8 @@ Torch golden（expert 体，**不含 router**）：[`torch_moe_golden.py`](torch
   - $\mathbf{W}^{(1)}_e \in \mathbb{R}^{2N \times K}$ → `w1[e]`，shape `(256, 4096)`，上半是 gate、下半是 up
   - $\mathbf{W}^{(2)}_e \in \mathbb{R}^{K \times N}$ → `w2[e]`，shape `(4096, 128)`
 - 路由结果（**已给定**，不算 softmax）：
-  - $e_{t,k} = \texttt{topk\_ids}[t,k]$
-  - $\alpha_{t,k} = \texttt{topk\_weight}[t,k]$（你测试里按行归一化，$\sum_k \alpha_{t,k}=1$）
+  - $e_{t,k} = topk_ids[t,k]$
+  - $\alpha_{t,k} = topk_weight[t,k]$（按行归一化，$\sum_k \alpha_{t,k}=1$）
 
 ---
 
