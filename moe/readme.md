@@ -25,13 +25,13 @@ Torch golden（expert 体，**不含 router**）：[`torch_moe_golden.py`](torch
 
 张量（与 `torch_experts` / `test_moe` 一致）：
 
-- 输入：$\mathbf{h}_t \in \mathbb{R}^{K}$，$t=0,\ldots,M-1$（一行 hidden）
+- 输入：$`\mathbf{h}_t \in \mathbb{R}^{K}`$，$`t=0,\ldots,M-1`$（一行 hidden）
 - 权重（expert $e$）：
   - $\mathbf{W}^{(1)}_e \in \mathbb{R}^{2N \times K}$ → `w1[e]`，shape `(256, 4096)`，上半是 gate、下半是 up
   - $\mathbf{W}^{(2)}_e \in \mathbb{R}^{K \times N}$ → `w2[e]`，shape `(4096, 128)`
 - 路由结果（**已给定**，不算 softmax）：
-  - $e_{t,k} = topk_ids[t,k]$
-  - $\alpha_{t,k} = topk_weight[t,k]$（按行归一化，$\sum_k \alpha_{t,k}=1$）
+  - $e_{t,k} = \mathit{topk\\_ids}[t,k]$
+  - $`\alpha_{t,k} = \mathit{topk\_weights}[t,k]`$ （按行归一化，$`\sum_k \alpha_{t,k}=1`$ ）
 
 ---
 
@@ -101,11 +101,11 @@ $$
 
 对某一个 $(t,k)$：
 
-1. $\mathbf{h}_t$: `(4096,)`
-2. $\mathbf{z} = \mathbf{h}_t \mathbf{W}^{(1)\top}_{e_{t,k}}$: `(256,)` = gate `(128,)` + up `(128,)`
-3. $\mathbf{a}$: `(128,)`
-4. $\mathbf{o}_{t,k} = \mathbf{a}\mathbf{W}^{(2)\top}_{e_{t,k}}$: `(4096,)`
-5. $\mathbf{y}_t = \sum_{k=1}^{10} \alpha_{t,k}\,\mathbf{o}_{t,k}$: `(4096,)`
+1. $`\mathbf{h}_t`$: `(4096,)`
+2. $`\mathbf{z} = \mathbf{h}_t \mathbf{W}^{(1)\top}_{e_{t,k}}`$: `(256,)` = gate `(128,)` + up `(128,)`
+3. $`\mathbf{a}`$: `(128,)`
+4. $`\mathbf{o}_{t,k} = \mathbf{a}\mathbf{W}^{(2)\top}_{e_{t,k}}`$: `(4096,)`
+5. $`\mathbf{y}_t = \sum_{k=1}^{10} \alpha_{t,k}\,\mathbf{o}_{t,k}`$: `(4096,)`
 
 整批输出 `out`: `(1024, 4096)`。
 
