@@ -181,7 +181,7 @@ for i in range(num_experts):          # i = 0..511
 
 ### 1. moe_sorting
 
-以[aiter.fused_moe.moe_sorting](https://github.com/ROCm/aiter/blob/v0.1.14/aiter/fused_moe.py#L98)为例
+以[aiter.fused_moe.moe_sorting](https://github.com/ROCm/aiter/blob/v0.1.14/aiter/fused_moe.py#L98)为例, 其torch ref逻辑可以参考[moe_sorting_ref in pyhip](https://github.com/tingqli/pyhip/blob/703063a8fa7b075b9a8a143ec8167886f88f4ac4/src/contrib/fused_moe.py#L56), 我们的理解来自[aiter的注释](https://github.com/ROCm/aiter/blob/v0.1.14/csrc/include/moe_sorting_opus.h#L270-L356)
 
 ```python
 sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
@@ -207,3 +207,33 @@ sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sort
 - `sorted_expert_ids` 每个 `TILE_M`维的block属于哪个expert 75766 / 128 = ⌈592.07⌉ = 592
 - `num_valid_ids`有效的元素信息, 在这里包含两个元素 `tensor([65536,  1024])`,第二个是这次的`num_token`，第一个表示kernel只处理`sorted_ids[0 : max_id)` 表示上界。65536 / 128 = 512 个 block  →  正好 512 个 expert，每个 expert 占 1 个 TILE_M=128 的块（在「每个 expert 都被命中」是个均匀分布 （实际上不一定这样）
 按 expert 分组、按 TILE_M 分块、带 padding」的 launch 表，处理成GPU友好的布局。
+
+这看上去还是难以理解，参考 [aiter注释的解释](https://github.com/ROCm/aiter/blob/v0.1.14/csrc/include/moe_sorting_opus.h#L270-L356) 有详细解释。
+
+为例方便理解 下面摘出比较重要的数据结构（e.g. num_experts = 6, topk=3, M_a = 4, input_tokens = 5）,这里不考虑EP。
+
+```C++
+// skip_experts_with_zero_tokens(SkipExpertsWithZeroTokens)
+// if enabled, the expert with no tokens will be skipped, in stead of padding to at least 1 unit_size(M_a)
+//
+//                                            (pack below tensor, skip element marked with `-`)
+//                           Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  Y  -  -  -  -  Y  Y  Y  Y
+// sorted_token_ids_ptr   : [0, 6, 6, 6, 2, 3, 4, 6, 1, 3, 6, 6, 0, 1, 2, 3, 4, 6, 6, 6, 6, 6, 6, 6, 0, 1, 2, 5]
+//                          |-  exp-0  -|-  exp-1  -|-  exp-2  -|-      exp-3          -|-  exp-4 -|-  exp-5  -|
+// sorted_weight_ptr      : [a, *, *, *, g, j, m, *, d, k, *, *, b, e, h, l, n, *, *, *, *, *, *, *, c, f, i, o]
+//
+//
+// sorted_expert_ids_ptr  : [0, 1, 2, 3, 3, 5]
+// num_tokens_post_padded_ptr : [24]
+```
+此外 sorted_token_ids  为了做 smooth quant 时需要知道是 第几个 topk 槽
+```
+ 31 ─── 24 │ 23 ───────── 0
+  topk_id  │  token_id
+  (8 bit)  │  (24 bit)
+```
+解包是下面这样，所以会出现右移24这样的操作。
+```C++
+tok_ids  = sorted_ids & 0xFFFFFF
+tok_topk = sorted_ids >> 24
+```
