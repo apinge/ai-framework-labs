@@ -1,6 +1,6 @@
 # moe 
 
-从头分析MOE (Top-k Sparse MoE + Shared Expert ) in [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json)的原理，torch基本计算（torch reference），ROCM上各种量化的区别和联系 和在framework里的实现
+从头分析MOE (Top-k Sparse MoE + Shared Expert )的原理， 以 [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json)TP8 为例，介绍torch基本计算（torch reference），kernel算法优化，ROCM上各种量化的区别和联系 和在framework里的实现。
 
 ## 从数学理解到矩阵计算
 
@@ -19,7 +19,7 @@ Torch golden（expert 体，**不含 router**）：[`torch_moe_golden.py`](torch
 |------|------|----------|
 | $M$ | token 数 | 1024 |
 | $K$ | hidden 维 | 4096 |
-| $N$ | 每个 expert 的 intermediate（TP 一切） | 128 |
+| $N$ | 每个 expert 的 intermediate（TP在这个维度切的） | 128 |
 | $E$ | expert 个数 | 512 |
 | $T$ | 每个 token 选的 expert 数 | 10 |
 
@@ -137,7 +137,7 @@ return out
 
 ## 算法优化 (torch)
 
-刚才的伪代码需要循环整个 `num_token` ，torch的实现一般改为循环`num_experts(E)`+ mask,vllm的参考代码和aiter和
+刚才的伪代码需要循环整个 `num_token (M)` ，torch的实现一般改为循环`num_experts(E)`+ mask, vllm的参考代码和aiter和
 [aiter的torch reference](https://github.com/ROCm/aiter/blob/d0c313d78eb04b495f6d126a281fe9e29a8d2d89/aiter/fused_moe.py#L1110)都采取了类似实现。
 
 先稍微复习下torch mask的用法。
@@ -147,8 +147,8 @@ mask = [True, False,False,False]
 a = torch.tensor([1,2,3,4],device="cuda")
 print(a[mask]) # tensor([1], device='cuda:0')
 out = torch.tensor([5,6,7,8],device="cuda")
-out[mask] = a[mask] # tensor([1, 6, 7, 8], device='cuda:0')
-print(out)
+out[mask] = a[mask] 
+print(out) # tensor([1, 6, 7, 8], device='cuda:0')
 ```
 ### 1. 先展平
 ```python
@@ -177,3 +177,33 @@ for i in range(num_experts):          # i = 0..511
 
 我们在kernel里一般不采取torch那样的循环循环`num_experts(E)`+ mask。 
 
+一种典型的实现 为 `moe_sorting` => `GEMM1 (gate up) ` => `SwiGLU` => `GEMM2 (down)` => `atomic / reduce`，并且根据prefill和decode，可能有各种优化或者简化。 非常典型地，由于decode一次推理token较少第一步`moe_sorting`和最后一步`atomic / reduce`, 可以有所简化。 再次我们暂时只虑数据量较大的prefill阶段，介绍这几个步骤。
+
+### 1. moe_sorting
+
+以[aiter.fused_moe.moe_sorting](https://github.com/ROCm/aiter/blob/v0.1.14/aiter/fused_moe.py#L98)为例
+
+```python
+sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+        topk_ids, # （num_tokens, num_experts_per_tok）(1024,10) 
+        topk_weight,  # （num_tokens, num_experts_per_tok） (1024,10)
+        E,   # num_experts 512
+        N2,     # reduce dim is same with output dim, i.e. hidden_size, 4096
+        hidden_states.dtype, # (num_tokens, hidden_size）
+        TILE_M, # 128 算 kernel用的
+        None,
+        None,
+        0,
+    )
+# sorted_ids.shape 75766
+# sorted_weights.shape, 75766
+#  sorted_expert_ids.shape 592
+#  num_valid_ids tensor([65536,  1024])
+# cur_out torch.Size([1024, 4096]) 预分配的 MoE 输出 buffer  (num_tokens, hidden_size）
+```
+`cur_out`这里是结果所需要的buffer很好理解。主要看其他几个。
+- `sorted_ids` 每条记录 哪个 token、第几个 topk 槽, 元素是int类型，长度为 M×TOPK + E×TILE_M − TOPK (10240 + 512×128 − 10=75766)
+- `sorted_weights` 与 `sorted_ids` 对应 记录路由权重 元素为float类型
+- `sorted_expert_ids` 每个 `TILE_M`维的block属于哪个expert 75766 / 128 = ⌈592.07⌉ = 592
+- `num_valid_ids`有效的元素信息, 在这里包含两个元素 `tensor([65536,  1024])`,第二个是这次的`num_token`，第一个表示kernel只处理`sorted_ids[0 : max_id)` 表示上界。65536 / 128 = 512 个 block  →  正好 512 个 expert，每个 expert 占 1 个 TILE_M=128 的块（在「每个 expert 都被命中」是个均匀分布 （实际上不一定这样）
+按 expert 分组、按 TILE_M 分块、带 padding」的 launch 表，处理成GPU友好的布局。
