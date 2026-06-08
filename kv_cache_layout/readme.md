@@ -121,3 +121,7 @@ page-size影响的是allocator
 从上面的分析看出, kv cache layout是否需要shuffle本身是为了适应kernel的实现，常见的layout一般是  key和value为`[num_tokens, num_kv_heads, head_size]`。
 
 aiter里kernel `pa_ps`等的新layout为 `[num_blocks, num_heads, heads_size//x, block_size, x]` ，为了把sglang里存储的kv 换成新shape，需要引入`reshape_and_cache_shuffle_kernel`.
+
+
+## kv cache 5d
+https://github.com/sgl-project/sglang/pull/27063
