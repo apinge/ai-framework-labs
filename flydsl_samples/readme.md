@@ -10,7 +10,8 @@ cd FlyDSL
 mkdir -p .claude/skills
 git submodule add https://github.com/org/your-skill-name .claude/skills/your-skill-name
 ```
-- roofline分析依据[理论上限](https://www.amd.com/en/products/accelerators/instinct/mi350/mi350p.html)
+- roofline分析依据[理论上限](https://www.amd.com/en/products/accelerators/instinct/mi350/mi350x.html)
+
 
 - 和hipkittens对比
 
@@ -20,10 +21,20 @@ entry
 ```
 python3 FlyDSL/tests/kernels/test_fp8_gemm_rowscale.py --wave_8 --preshuffle_b 
 
+[flyc] Throughput: 421.0 us, 2611.91 TFLOPS, BW: 0.638 TB/s
 ```
 `--wave_8`这个输入走的8wave的版本
 
 默认 M=N=K=8192, tile_m=tile_n=256, static_weight_scale=True
+
+roofline分析
+```
+FLOPs = 2 × M × N × K = 2 × 8192^3 ≈ 1.0995 × 10^12 FLOPs (约 1.1 TFLOP)
+
+Time = 421.0 us
+TFLOPS = 1.0995e12 / 421e-6 ≈ 2611 TFLOPS ✓ (与报告一致)
+```
+峰值算力4.6 PFLOPs， 除以下 差不多 56.7%
 
 
 编译期常量
