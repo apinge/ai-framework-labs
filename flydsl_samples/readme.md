@@ -298,11 +298,3 @@ Speedup (avg ): 22442.17x
 
 Correctness: PASSED
 ```
-# splitK
-wave 在k方向切分四个
-make_tiled_mma
-
-# print
-vector 能直接打 
-Tensor不能打印
-.load()+=
