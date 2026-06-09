@@ -12,7 +12,7 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.runtime.device import get_rocm_arch 
+from flydsl.runtime.device import get_rocm_arch
 
 from flydsl.expr.typing import Vector as Vec
 from flydsl._mlir.dialects import fly as fly_dialect
@@ -29,6 +29,7 @@ from fp8_gemm_utils import (
     compute_global_swizzle,
     swizzle_128,
     pack_i32x4_i32x8,
+    wait_barrier,
 )
 
 # from kernels.fp8_gemm_utils import (
@@ -50,14 +51,17 @@ ARCH = str(get_rocm_arch())
 
 OUTPUT_TYPST = "layout.typ"
 
+
 # helper class
 class Mfma16x16x128:
     def __init__(self, n_tiles_a, n_tiles_b):
-        self.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
+        self.atom = fx.make_mma_atom(
+            fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
+        )
         # ↑ 对应硬件指令 v_mfma_scale_f32_16x16x128_f8f6f4
 
         self.accum_type = Vec.make_type(4, fx.Float32)  # 每 lane 4个 f32
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32) # 初始累加器 [0,0,0,0]
+        self.zero_value = Vec.filled(4, 0.0, fx.Float32)  # 初始累加器 [0,0,0,0]
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 
@@ -79,7 +83,7 @@ class Mfma16x16x128:
         assert len(c) == self.n_tiles_a * self.n_tiles_b
         # a: list[8] (n_tiles_a=4 个 i32x8 frag)
         # b: list[4] (n_tiles_b=2 个 i32x8 frag)
-        # c: list[8] (4×2=8 个 Vec<4,f32>) 
+        # c: list[8] (4×2=8 个 Vec<4,f32>)
         """
         block_size = 512 threads = 8 waves
 
@@ -128,8 +132,8 @@ class Mfma16x16x128:
         A1(192~255) c10 ↗             c11 ↗
 
         """
-        for i in range_constexpr(self.n_tiles_a): #  for i in 0..4:      # A 的 tile 行
-            for j in range_constexpr(self.n_tiles_b): # for j in 0..2:   # B 的 tile 列
+        for i in range_constexpr(self.n_tiles_a):  #  for i in 0..4:      # A 的 tile 行
+            for j in range_constexpr(self.n_tiles_b):  # for j in 0..2:   # B 的 tile 列
                 c[self.idx(i, j)] = self._do_mma(a[i], b[j], c[self.idx(i, j)])
                 #  每个 wave 计算 8 次 MFMA，覆盖 64×32 的输出 tile
                 # 可以这样想 16x16x128结果C是16X16 那么 覆盖的大小就是16*16*8
@@ -141,7 +145,7 @@ class Mfma16x16x128:
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
-class G2SLoader: #Global Memory → LDS 搬运
+class G2SLoader:  # Global Memory → LDS 搬运
     def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         # ↑ AMD buffer_load_dwordx4_lds 指令：每线程一次搬 128bit = 16 fp8 elements
@@ -155,18 +159,18 @@ class G2SLoader: #Global Memory → LDS 搬运
         self.n_load_steps = n_load_steps
         self.wave_id = wave_id
         self.n_waves = fx.block_dim.x // 64
-    
-    """
-    LDS 布局（一个半块 = 16384 bytes）
-    [0    ..1023 ] wave0 step0  (rows  0~7  , cols 0~127)
-    [1024 ..2047 ] wave1 step0  (rows  8~15 , cols 0~127)
-    ...
-    [7168 ..8191 ] wave7 step0  (rows 56~63 , cols 0~127)
-    [8192 ..9215 ] wave0 step1  (rows 64~71 , cols 0~127)
-    ...
-    [15360..16383] wave7 step1  (rows120~127, cols 0~127)
 
-    """
+        """
+        LDS 布局（一个半块 = 16384 bytes）
+        [0    ..1023 ] wave0 step0  (rows  0~7  , cols 0~127)
+        [1024 ..2047 ] wave1 step0  (rows  8~15 , cols 0~127)
+        ...
+        [7168 ..8191 ] wave7 step0  (rows 56~63 , cols 0~127)
+        [8192 ..9215 ] wave0 step1  (rows 64~71 , cols 0~127)
+        ...
+        [15360..16383] wave7 step1  (rows120~127, cols 0~127)
+
+        """
 
     def _lds_dst_at(self, lds_dst, step):
         step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
@@ -185,13 +189,14 @@ class G2SLoader: #Global Memory → LDS 搬运
             fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
             #                              ↑ K 方向的推进量（每K-iter加 BLOCK_K 个元素）
 
-    def load_one(self, lds_dst, k_offset, step): 
+    def load_one(self, lds_dst, k_offset, step):
         # # 只做1个step，用于 ping-pong 流水线的 prologue/epilogue
         src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
         dst = self._lds_dst_at(lds_dst, step)
         fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
 
-class S2RLoader: # LDS → (VGPR）
+
+class S2RLoader:  # LDS → (VGPR）
     def __init__(self, wave_idx, n_tiles):
         self.lane_id = fx.thread_idx.x % 64
         self.wave_idx = wave_idx
@@ -203,7 +208,7 @@ class S2RLoader: # LDS → (VGPR）
         ptr_off = fx.add_offset(lds_src.ptr, off_tup)
         i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
         view = fx.make_view(i8_iter, fx.make_layout(16, 1))
-        return view.load() # → Vec<16, uint8>
+        return view.load()  # → Vec<16, uint8>
 
     def load(self, lds_src, preshuffled=False):
         """
@@ -259,8 +264,11 @@ class S2RLoader: # LDS → (VGPR）
         v = self._vec_load_16xf8(lds_src, lds_offset)
         return v.bitcast(fx.Int32)
 
+
 class StoreC:
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
+    def __init__(
+        self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b
+    ):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -270,12 +278,16 @@ class StoreC:
         # Exact byte counts from compile-time shape (BF16 C output, FP32 scales).
         # ``num_records_bytes`` is required when ``max_size=False`` -- see
         # ``make_buffer_tensor`` docstring for the silent-OOB rationale.
-        c_nbytes = c_rows * c_cols * 2  # BFloat16 = 2 bytes
-        sa_nbytes = c_rows * 4  # Float32 row-wise scale
-        sb_nbytes = c_cols * 4  # Float32 col-wise scale
+        c_nbytes = c_rows * c_cols * 2  # BFloat16 = 2 bytes, C: bf16, 2 bytes/elem
+        sa_nbytes = c_rows * 4  # Float32 row-wise scale, scale_a: fp32, 行粒度 (8192,)
+        sb_nbytes = c_cols * 4  # Float32 col-wise scale,  scale_b: fp32, 列粒度 (8192,)
         gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
-        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=sa_nbytes)
-        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=sb_nbytes)
+        gSA = fx.rocdl.make_buffer_tensor(
+            A_scale, max_size=False, num_records_bytes=sa_nbytes
+        )
+        gSB = fx.rocdl.make_buffer_tensor(
+            B_scale, max_size=False, num_records_bytes=sb_nbytes
+        )
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
         self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
         self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
@@ -287,38 +299,93 @@ class StoreC:
         self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         self.reg_bf16_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.BFloat16)
 
+    """
+        # 3种 copy atom（不同粒度）
+        scale_atom_4  → 一次读 4个 fp32 scale（128bit）
+        scale_atom_1  → 一次读 1个 fp32 scale（32bit）
+        out_atom_1    → 一次写 1个 bf16 到 C（16bit）
+    """
+
     def _load_scale_vec4(self, row):
-        fx.copy(self.scale_atom_4, fx.slice(self.sa_div, (None, fx.Int32(row))), self.reg_f32_4)
+        fx.copy(
+            self.scale_atom_4,
+            fx.slice(self.sa_div, (None, fx.Int32(row))),
+            self.reg_f32_4,
+        )
         return Vec(fx.memref_load_vec(self.reg_f32_4))
 
     def _load_scale_scalar(self, col):
-        fx.copy(self.scale_atom_1, fx.slice(self.sb_div, (None, fx.Int32(col))), self.reg_f32_1)
+        fx.copy(
+            self.scale_atom_1,
+            fx.slice(self.sb_div, (None, fx.Int32(col))),
+            self.reg_f32_1,
+        )
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _store_bf16(self, value_bf16, c_index):
         fx.memref_store_vec(Vec.filled(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
-        fx.copy(self.out_atom_1, self.reg_bf16_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+        fx.copy(
+            self.out_atom_1,
+            self.reg_bf16_1,
+            fx.slice(self.c_div, (None, fx.Int32(c_index))),
+        )
 
     def store(self, c_frag, base_row, base_col):
+        """
+        lane 分工（代入具体值）
+        每个 lane 负责输出矩阵中的哪些元素？
+
+        tile 内坐标:
+        行: (lane_id // 16) * 4 + 0..3   → 4行
+        列:  lane_id % 16                → 1列
+
+        单个 wave (64 lanes) 覆盖一个 16×16 的 MFMA 输出 tile:
+        行: 4 groups × 4 rows = 16行 ✓
+        列: 16列 ✓
+
+        n_tiles_a=4, n_tiles_b=2 → 每 wave 写 64行 × 32列 = 2048 个 bf16
+
+        数据流总结
+        c_frag[8]           a_scales[4]     b_scales[2]
+        (fp32 MFMA输出)    (行scale vec4)  (列scale 标量)
+            ↓                  ↓               ↓
+        vec[i] × a_scale[i] × b_scale  (fp32乘法)
+            ↓
+        .to(BFloat16)
+            ↓
+        BufferCopy16b → C[row+i][col]  (全局内存)
+        """
         a_scales = [
-            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4) for i in range_constexpr(self.n_tiles_a)
+            # 每个 A-tile 对应4行，lane_id//16 决定这个lane负责哪4行
+            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
+            for i in range_constexpr(self.n_tiles_a)
+            # → Vec<4, f32>，一次读4个连续行的scale
         ]
         b_scales = [
-            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16) for i in range_constexpr(self.n_tiles_b)
+            # 每个 B-tile 对应1列
+            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
+            for i in range_constexpr(self.n_tiles_b)
+            # → f32 标量
         ]
-        for ti in range_constexpr(self.n_tiles_a):
+        for ti in range_constexpr(self.n_tiles_a):  # 4个A-tile
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
-            for tj in range_constexpr(self.n_tiles_b):
+            for tj in range_constexpr(self.n_tiles_b):  # 2个B-tile
                 col = base_col + tj * 16 + self.lane_id % 16
                 col_valid = col < self.c_cols
                 oob = fx.Int32(self.c_rows * self.c_cols)
-                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                vec_f32 = Vec(
+                    c_frag[self.c_idx_fn(ti, tj)]
+                )  # MFMA输出：Vec<4, f32> [???]
                 for i in range_constexpr(4):
-                    scaled = (vec_f32[i] * (a_scales[ti][i] * b_scales[tj])).to(fx.BFloat16)
+                    scaled = (vec_f32[i] * (a_scales[ti][i] * b_scales[tj])).to(
+                        fx.BFloat16
+                    )
+                    #                        ↑ 行scale           ↑ 列scale
                     c_index = (row + i) * self.c_cols + col
                     self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
+                    #                               ↑ 越界保护：col>=N时写到哑地址
 
-    
+
 # begin kernel
 def compile_fp8_gemm_8w(
     *, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_preshuffled: bool = False
@@ -444,9 +511,9 @@ def compile_fp8_gemm_8w(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
-        # 8wave的分配方法 
-        wave_m = wave_id // 4 
-        wave_n = wave_id % 4  
+        # 8wave的分配方法
+        wave_m = wave_id // 4
+        wave_n = wave_id % 4
 
         # fx.block_idx.x//32 fx.block_idx.x%32
         # fx.block_idx.x 对应grid=(1024, 1, 1)
@@ -481,7 +548,6 @@ def compile_fp8_gemm_8w(
         gA = make_fp8_buffer_tensor(A, F8_IR_t)
         gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
 
-
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -492,19 +558,15 @@ def compile_fp8_gemm_8w(
         # [???]
         # 这里主要就是为了减少bank conflict那种swizzle 我们先忽略实现细节
         gl_off_a = compute_global_swizzle(
-            lane_id,       # 0~63，本线程在 wavefront 内的编号
-            wave_id,       # 0~7，本 wavefront 在 block 内的编号
-            K,             # 8192
-            N_LDS_ROUNDS,   # G2S 需要几轮才能填满一个半 tile 2
-            preshuffled=False,   # A 永远不做 preshuffle
+            lane_id,  # 0~63，本线程在 wavefront 内的编号
+            wave_id,  # 0~7，本 wavefront 在 block 内的编号
+            K,  # 8192
+            N_LDS_ROUNDS,  # G2S 需要几轮才能填满一个半 tile 2
+            preshuffled=False,  # A 永远不做 preshuffle
         )
 
         gl_off_b = compute_global_swizzle(
-            lane_id,
-            wave_id,
-            K,
-            N_LDS_ROUNDS,
-            preshuffled=True    # B 已经 preshuffle 过
+            lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=True  # B 已经 preshuffle 过
         )
 
         mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
@@ -514,11 +576,232 @@ def compile_fp8_gemm_8w(
         #                 ↑ 需要 2D hierarchical tensor
         #                   才能用 (tile_offset, outer_offset) 两级索引计算地址
 
-        a_s2r = S2RLoader(wave_m, N_TILES_A) # N_TILES_A:4 
-        b_s2r = S2RLoader(wave_n, N_TILES_B) # N_TILES_B:2
+        a_s2r = S2RLoader(wave_m, N_TILES_A)  # N_TILES_A:4
+        b_s2r = S2RLoader(wave_n, N_TILES_B)  # N_TILES_B:2
 
         store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
+        # 2x2 config of 4x2 (instead of 4x4 in 4wave) 16x16 sub-tiles
+        c00_frag = [
+            mfma.zero_value
+        ] * N_ACCUMS  # N_ACCUMS=8 每个thread的 acc 数量 这个cxx_frag是存mfma结果的 [???]是不是每个thread 同时做8次mfma做4组？
+        c01_frag = [mfma.zero_value] * N_ACCUMS
+        c10_frag = [mfma.zero_value] * N_ACCUMS
+        c11_frag = [mfma.zero_value] * N_ACCUMS
+
+        # 从这里开始就是流水线了
+        """
+        wave_m=0, wave_n=0..3 的 store 目标：
+
+                 B0(cols 0~127)    B1(cols 128~255)
+        A0(0~63)    c00 ↗             c01 ↗
+        A1(128~191) c10 ↗             c11 ↗
+
+        wave_m=1, wave_n=0..3 的 store 目标：
+
+                B0(cols 0~127)    B1(cols 128~255)
+        A0(64~127)  c00 ↗             c01 ↗
+        A1(192~255) c10 ↗             c11 ↗
+
+        c00_frag[8]: wave 计算 A0(上半) × B0(左半) 的结果
+        c01_frag[8]: wave 计算 A0(上半) × B1(右半) 的结果
+        c10_frag[8]: wave 计算 A1(下半) × B0(左半) 的结果
+        c11_frag[8]: wave 计算 A1(下半) × B1(右半) 的结果
+                      ↑ 对应 LDS 里 4 对 cur/next ping-pong buffer
+        """
+        # 发射 G2S (k=0)
+        # 按理来说每个 2opsX dwordx4 32个fp8
+        b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)  # b_cur0 ← B0[k=0]   ← 2 ops
+        a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)  # a_cur0 ← A0[k=0]   ← 2 ops
+        b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)  # b_cur1 ← B1[k=0]   ← 2 ops
+        a_g2s.load(
+            a_cur1, A1_gl_offset + 0 * BLOCK_K
+        )  # a_cur1 ← A1[k=0]   ← 2 ops  共8 ops in-flight
+
+        if wave_m == 1:
+            rocdl.s_barrier()  #  ← wave_m=1 稍晚启动，避免争抢G2S带宽
+
+        # 为什么 global -> LDS 过程里用看到的是 vmcnt 而不是 lgkmcnt
+        # 你等的是“global load 完成”这件事，不是“写 LDS 完成”这件事。
+        wait_barrier(
+            N_LDS_STEPS_A + N_LDS_STEPS_B
+        )  # 4, wait_barrier(4) ← 等到 ≤4 个pending，即 b_cur0/a_cur0(k=0) 已完成
+
+        # 发射 G2S (k=1) 的3/4：
+        b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)  # b_next0 ← B0[k=1]
+        a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)  # a_next0 ← A0[k=1]
+        b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)  # b_next1 ← B1[k=1]
+        # ⚠️ a_next1(k=1) 故意缺失！留给主循环第一次迭代补
+
+        wait_barrier(
+            N_LDS_STEPS_A + 2 * N_LDS_STEPS_B
+        )  #  ← 等到 ≤6 个pending，b_next1(k=1) 可用
+
+        for k in range_constexpr(K_ITERS - 2):
+            """─── 读寄存器 + 补齐k+1 ───────────────────────────────────"""
+            b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)  # ← k的B0读入寄存器
+            a0_frag = a_s2r.load(a_cur0)  # ← k的A0读入寄存器
+            a_g2s.load(
+                a_next1, A1_gl_offset + (k + 1) * BLOCK_K
+            )  # ← 补齐k+1的最后一块！
+            rocdl.s_barrier()  #  等同__builtin_amdgcn_s_barrier(); 整个workgroup同步
+
+            """─── MFMA c00 ────────────────────────────────────────────"""
+            rocdl.s_setprio(1)
+            c00_frag = mfma.call(
+                a0_frag, b0_frag, c00_frag
+            )  # c00 += a0 × b0  ← A0(上半) × B0(左半)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            """─── 读b1 + 开始预取k+2 ──────────────────────────────────"""
+            b1_frag = b_s2r.load(
+                b_cur1, preshuffled=b_preshuffled
+            )  # ← k的B1读入寄存器（b_cur1已读完可复用)
+            b_g2s.load(
+                b_cur0, B0_gl_offset + (k + 2) * B_K_STEP
+            )  #  ← 复用已读完的b_cur0装k+2
+            rocdl.s_barrier()
+
+            """─── MFMA c01 ────────────────────────────────────────────"""
+            rocdl.s_setprio(1)
+            c01_frag = mfma.call(
+                a0_frag, b1_frag, c01_frag
+            )  # c01 += a0 × b1 ← A0(上半) × B1(右半)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            """─── 读a1 + 继续预取k+2 ──────────────────────────────────"""
+            a1_frag = a_s2r.load(a_cur1)  # ← k的A1读入寄存器
+            a_g2s.load(
+                a_cur0, A0_gl_offset + (k + 2) * BLOCK_K
+            )  # ← 复用已读完的a_cur0装k+2
+            rocdl.s_barrier()
+
+            """─── MFMA c10 ────────────────────────────────────────────"""
+            rocdl.s_setprio(1)
+            c10_frag = mfma.call(
+                a1_frag, b0_frag, c10_frag
+            )  # c10 += a1 × b0  ← A1(下半) × B0(左半)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            """─── 完成k+2预取 ─────────────────────────────────────────"""
+            b_g2s.load(
+                b_cur1, B1_gl_offset + (k + 2) * B_K_STEP
+            )  # G2S: b_cur1 ← B1[k+2]
+            wait_barrier(
+                2 * N_LDS_STEPS_A + N_LDS_STEPS_B
+            )  # ← 等 a_next1(k+1) + a_cur0(k+2) + b_cur0(k+2) 就绪
+
+            """─── MFMA c11 ────────────────────────────────────────────"""
+            rocdl.s_setprio(1)
+            c11_frag = mfma.call(
+                a1_frag, b1_frag, c11_frag
+            )  # c11 += a1 × b1 ← A1(下半) × B1(右半)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            """─── 交换 cur↔next ────────────────────────────────────────"""
+            a_cur0, a_next0 = a_next0, a_cur0
+            a_cur1, a_next1 = a_next1, a_cur1
+            b_cur0, b_next0 = b_next0, b_cur0
+            b_cur1, b_next1 = b_next1, b_cur1
+
+            """
+            时间 →
+           [S2R a0,b0][G2S a_next1(k+1)][MFMA c00][S2R b1][G2S b_cur0(k+2)][MFMA c01]
+                                                  ↑ 内存IO与计算并行
+           [S2R a1][G2S a_cur0(k+2)][MFMA c10][G2S b_cur1(k+2)][MFMA c11]
+            """
+
+        # Epilogue k = K_ITERS-2（倒数第2轮）
+        # 不再预取 k+2（已是最后），但需要补一次 a_next1 的特殊处理：
+        k = K_ITERS - 2
+        b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
+        a0_frag = a_s2r.load(a_cur0)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a1_frag = a_s2r.load(a_cur1)
+        # Main loop prefetches a_next1 one step behind; issue the final
+        # K_ITERS - 1 tile here, otherwise c10 / c11 read stale A1 data.
+        a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
+        # ↑ 主循环一直滞后一步，这里补上最后一块A1
+
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+        # Swap cur and next
+        a_cur0, a_next0 = a_next0, a_cur0
+        a_cur1, a_next1 = a_next1, a_cur1
+        b_cur0, b_next0 = b_next0, b_cur0
+        b_cur1, b_next1 = b_next1, b_cur1
+
+        # Step k = K_ITERS - 1
+        # Epilogue k = K_ITERS-1（最后一轮）
+        k = K_ITERS - 1
+        a0_frag = a_s2r.load(a_cur0)
+        wait_barrier(0)  #  ← 等所有in-flight G2S全部完成
+
+        rocdl.s_setprio(1)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a1_frag = a_s2r.load(a_cur1)
+        rocdl.s_barrier()
+        # 计算 c10/c11 合并：
+        # s_setprio(1)
+        # c10 += a1 × b0
+        # c11 += a1 × b1   ← 最后两个 MFMA 合并发射
+        # s_setprio(0)
+        rocdl.s_setprio(1)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        wave_n_offset = wave_n * (N_TILES_B * 16)
+        wave_m_offset = wave_m * (N_TILES_A * 16)
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
+        # Store
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         pass
 
     @flyc.jit
@@ -647,7 +930,8 @@ def _bench_fp8_gemm(
     torch.cuda.synchronize()
 
     c_out_f32 = c_out_raw.to(torch.float32)
-    # assert torch.allclose(c_out_f32, c_ref, rtol=0.1, atol=0.1)
+    assert torch.allclose(c_out_f32, c_ref, rtol=0.1, atol=0.1)
+    print("torch.allclose pass")
     pass
 
 

@@ -4,6 +4,7 @@ import torch
 import flydsl.expr as fx
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import const_expr, range_constexpr
+from flydsl._mlir.dialects import llvm as _llvm
 
 
 # Simple dtypes namespace used by pertoken_quant
@@ -103,6 +104,7 @@ def ceildiv(a: int, b: int) -> int:
 def divmod(a: int, b: int) -> tuple[int, int]:
     return (a // b, a % b)
 
+
 # 一个类型系统上的 reinterpret_cast，从 MLIR IR 层面把 i8* 换成 f8E4M3FN*，底层 GPU 内存地址和数据完全不变。
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     # max_size=False with no num_records_bytes: cosize(layout) becomes a
@@ -115,7 +117,7 @@ def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     t_i8 = fx.rocdl.make_buffer_tensor(arg_i8, max_size=False)
 
     # 步骤2：从 buffer descriptor 拿到迭代器（带类型信息的指针抽象）
-    iter_i8 = fx.get_iter(t_i8) # 类型是 int8 buffer ptr
+    iter_i8 = fx.get_iter(t_i8)  # 类型是 int8 buffer ptr
 
     # 步骤2：构造一个"fp8 类型的 buffer 指针类型"
     # 地址空间保持 BufferDesc（VGPR buffer 寄存器）
@@ -132,6 +134,7 @@ def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     # 步骤5：用原 layout（stride/shape）重新包装成 fp8 Tensor 返回
     return fx.Tensor(fx.make_view(iter_f8, fx.get_layout(t_i8)))
 
+
 def swizzle_128(row, col):
     offset = row * 128 + col
     swizzle = ((offset % (16 * 128)) >> 8) << 4
@@ -147,7 +150,11 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
             row = lane_id % 8 + wave_id * 8 + round * (n_waves * 8)
             col = (lane_id // 8) * 16
             offsets.append(
-                (row // 16) * (K * 16) + (row % 16) * 16 + (col // 64) * 1024 + ((col % 64) // 16) * 256 + (col % 16)
+                (row // 16) * (K * 16)
+                + (row % 16) * 16
+                + (col // 64) * 1024
+                + ((col % 64) // 16) * 256
+                + (col % 16)
             )
         else:
             row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
@@ -156,6 +163,17 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
             offsets.append(r * K + c)
     return offsets
 
+
 def pack_i32x4_i32x8(lo, hi):
     # Pack two i32x4 as one i32x8
     return lo.shuffle(hi, list(range(8)))
+
+
+def wait_barrier(count):
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
+        constraints="",
+        has_side_effects=True,
+    )

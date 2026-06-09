@@ -37,7 +37,154 @@ LDS = 16384*8/1024= 128 KB (CDNA4 160KB是够用的)
 grid_x:	32 × 32 = 1024 blocks
 ```
 
-### pipeline分析
+
+### 流水线分析1-任务分配
+用 8192×8192 例子
+
+- 整体任务分配
+```
+M=N=K=8192, BLOCK_M=BLOCK_N=256, BLOCK_K=128
+─────────────────────────────────────────────
+Grid:  (8192/256)*(8192/256)=32 × 32 = 1024 blocks（每个block算一个 BLOCK_M*BLOCK_N=256×256 的 C tile）
+Block: 512 threads = 8 waves
+K-iters: 8192 / 128 = 64 次 K 循环
+
+每个 block 总工作量:
+  (256, 8192)@(256,8192)
+  分到 8 waves
+  ───────────────
+```
+- 一个wave计算哪些
+```
+block 内的 256×256 输出 tile，8 个 wave 这样切分：
+
+       cols 0..31  32..63  64..95  96..127 128..159 160..191 192..223 224..255
+            │       │       │        │        │        │        │        │
+rows 0..63  │ w0/c00│ w1/c00│ w2/c00 │ w3/c00 │ w0/c01 │ w1/c01 │ w2/c01 │ w3/c01
+            ├───────┼───────┼────────┼────────┼────────┼────────┼────────┼────────
+rows 64..127│ w4/c00│ w5/c00│ w6/c00 │ w7/c00 │ w4/c01 │ w5/c01 │ w6/c01 │ w7/c01
+            ├───────┼───────┼────────┼────────┼────────┼────────┼────────┼────────
+rows128..191│ w0/c10│ w1/c10│ w2/c10 │ w3/c10 │ w0/c11 │ w1/c11 │ w2/c11 │ w3/c11
+            ├───────┼───────┼────────┼────────┼────────┼────────┼────────┼────────
+rows192..255│ w4/c10│ w5/c10│ w6/c10 │ w7/c10 │ w4/c11 │ w5/c11 │ w6/c11 │ w7/c11
+
+每个 wave 持有 4 个 c_frag (c00/c01/c10/c11)，分散在 4 个象限
+单个 wave 总输出: 4 × (64×32) = 8192 个 bf16
+8 waves × 8192 = 256×256 ✓
+```
+注意每个64X32的块 代表 8个mfma的结果(16X16), 一次k iter 要做完4个(64X32)块对应的计算
+- 一个 wave 一轮 K-iter 干啥
+每轮 K-iter共 64 轮(8192//128)，单个 wave 要做：
+```
+读寄存器 (S2R, 从LDS):
+  a0_frag = 4 个 (32xfp8)  (从 a_cur0 读，覆盖A的上半64行)
+  a1_frag = 4 个 (32xfp8)  (从 a_cur1 读，覆盖A的下半64行)
+  b0_frag = 2 个 (32xfp8)  (从 b_cur0 读，覆盖B的左半32列)
+  b1_frag = 2 个 (32xfp8)  (从 b_cur1 读，覆盖B的右半32列)
+
+计算 (MFMA):
+  c00 += a0 × b0    内含 4×2 = 8 条 MFMA
+  c01 += a0 × b1    内含 8 条
+  c10 += a1 × b0    内含 8 条
+  c11 += a1 × b1    内含 8 条
+                    ──────
+                    32 MFMA / wave / K-iter
+
+64 K-iters → 每个wave每block共 2048 MFMA
+```
+- 关键：LDS 是 block 共享的，8 waves 一起搬数据！
+```
+b_g2s.load(b_cur0, ...)  # ← 这一行由所有 512 threads(8X64) 同时执行
+```
+
+每个 wave 用 wave_id 计算自己的 LDS 写入位置：
+```
+step_off = wave_id * 1024 + step * 8192
+```
+每次 b_g2s.load 的搬运量：
+```
+8 waves × 64 lanes × 16 fp8/lane × 2 steps = 16384 fp8 = 一个 LDS half-tile (128×128)
+```
+所以"加载 b_cur0"这件事是 8 个 wave 一起完成的，单个 wave 只搬 1/8。
+- Pipeline 在做什么
+没有 pipeline 的"裸版"K-iter（串行）：
+```
+[G2S k] → [等G2S完成] → [S2R k] → [MFMA k] → [G2S k+1] → ...
+                       ▲
+                       这里 MFMA 单元闲着，G2S 单元也闲着
+```
+有 pipeline 的版本（重叠）：
+```
+时间轴 →
+K-iter k:    [S2R][MFMA c00]  [G2S k+1]
+                  [S2R][MFMA c01]    [G2S k+2 partial]
+                       [S2R][MFMA c10]      [G2S k+2 cont]
+                            [S2R][MFMA c11]
+                            ↑ 计算单元几乎不闲
+```
+- 每条 MFMA 之间都插入了一次 G2S 发射，让内存单元和 MFMA 单元都满载
+- [s_setprio(1/0)]fp8_gemm_8wave.py ) 锁定 MFMA 优先发射
+- wait_barrier(N) 控制最多有 N 个 G2S in-flight，防止内存子系统过载
+
+### 计算总共需要多少lds
+```
+单个 MFMA 16×16×128 需要:
+  A: 16行 × 128K = 2048 fp8
+  B: 128K × 16列 = 2048 fp8
+
+8 waves 联合覆盖:
+  A: 16 × 128 × 8 = 16384 fp8  ← 这个数字是对的！
+```
+对应 a_lds_size = LDS_BLOCK_M × BLOCK_K = 128 × 128 = 16384 fp8  
+
+BLOCK_M/N 被切成两半（A0/A1, B0/B1)
+```
+BLOCK_M = 256 行
+  ↓ 切成 A0(rows 0~127) + A1(rows 128~255)
+LDS_BLOCK_M = 128
+
+→ 需要 2 个 A buffer (A0_lds, A1_lds)
+→ 需要 2 个 B buffer (B0_lds, B1_lds)
+```
+
+
+ping-pong 双缓冲（cur + next）
+```
+cur 缓冲: 当前 K-iter k 的数据 (S2R + MFMA 在用)
+next 缓冲: 下一个 K-iter k+1 的数据 (G2S 正在搬)
+                     ↓
+              swap 后 cur ↔ next
+```
+完整汇总
+```
+单个 buffer:           16384 fp8  = 16 KB    ← 你算到这里
+                          × 2  (A0 + A1)
+─────────────────────────────────
+A-side cur:            32768 fp8  = 32 KB
+                          × 2  (B 同理)
+─────────────────────────────────
+所有 cur:              65536 fp8  = 64 KB    ← 你的"32KB×2"差不多到这
+                          × 2  (cur + next ping-pong)
+─────────────────────────────────
+LDS 总量:             131072 fp8  = 128 KB  ✓
+```
+所以总结：你算的 32KB ×2 (A0/A1切分) ×2 (ping-pong) = 128KB
+
+### 流水线分析2 
+
+流水线也可以参考[HipKittens FP8_8wave](https://github.com/HazyResearch/HipKittens/blob/main/kernels/gemm/fp8fp32/FP8_8wave/8_wave.cu)
+
+层1: G2S(k+2) 与 MFMA(k) 并行
+层2: ping-pong 双缓冲 cur/next 交替
+层3: 4个 MFMA(c00/01/10/11) 与 G2S 交织
+
+
+
+```
+s_setprio(1)  ← 告诉调度器：优先发射 MFMA，别插入内存指令
+  c00 = mfma(...)
+s_setprio(0)  ← 恢复正常优先级，允许 G2S 指令穿插
+```
 
 ### api分析
 
@@ -151,3 +298,11 @@ Speedup (avg ): 22442.17x
 
 Correctness: PASSED
 ```
+# splitK
+wave 在k方向切分四个
+make_tiled_mma
+
+# print
+vector 能直接打 
+Tensor不能打印
+.load()+=
