@@ -107,21 +107,67 @@ def gemm_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
     copy_atom_c  = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
 
     # make_tiled_copy_A/B/C: 把 copy_atom 和 tiled_mma 的 TV layout 组合
-    # 生成的 tiled_copy 包含 TV layout (Thread×Value 到数据坐标的映射):
+    # 生成的 tiled_copy 包含 TV layout (Thread×Value 到数据坐标的映射)
+    #
+    # ── TV layout 怎么读 ─────────────────────────────────────────────────
+    # shape 部分 (16,4,2,2) 描述线程分组方式 — 直接告诉你谁做什么:
+    #   16: atom 内 M 行号
+    #    4: K 分组 (每组 8 列)
+    #    2: M 方向 2 个 atom 块
+    #    2: N 方向 2 个 atom 块
+    #
+    # stride 部分 (1,256,16,0) 是在 copy tile (32×32) 的 colex (列优先)
+    # 坐标空间里的平坦索引。colex(32,32) 中 M 是快变维:
+    #   position p → m = p%32, k = p/32
+    #   stride 1  → m+1 (下一行)
+    #   stride 32 → k+1 (下一列)
+    # 例: stride 256 = 8×32 → k+=8; stride 16 → m+=16
+    #
+    # 下面同时给出 lowered IR (08_convert_fly_to_rocdl.mlir) 验证的
+    # 实际内存地址公式，两种理解方式可以对照:
     #
     # tiled_copy_A TV layout:
     #   ((16,4,2,2),(8,(1,1))):((1,256,16,0),(32,(0,0)))
-    #    ↑ Thread 分解        ↑ Value 分解
-    #   Thread: 16×4×2×2 = 256 threads
-    #     - 16: wave 内 tid (对应 M 方向 16 行)
-    #     -  4: wave 内 K 分组 (GroupK=64/16=4)
-    #     -  2: atom_layout M 方向的 2 个 wave-group
-    #     -  2: M_rep (每 wave 重复 2 次)  ← stride=0: 同一数据不同 wave
-    #   Value: 8 个 bf16 per thread (K 方向连续)
+    #
+    #   Thread (16,4,2,2) — 线程分组:
+    #     t0 = tid%16      atom 内 M 行号 (0..15)
+    #     t1 = (tid/16)%4  K 分组编号 (0..3, 每组 8 列)
+    #     t2 = (tid/64)%2  atom_layout M 方向: 选第几个 16 行 atom 块
+    #     t3 = tid/128     atom_layout N 方向: 对 A 无影响 (stride=0)
+    #
+    #   Value (8):
+    #     v = 0..7         一次 128b load 的 8 个连续 bf16 (K 方向)
+    #
+    #   实际地址公式 (lowered IR 验证):
+    #     row = t0 + t2*16           (0..31, 在 copy tile 内)
+    #     col = t1*8 + v             (v=0..7, 8 个连续 K 列)
+    #     A_offset = row * lda + col
+    #   M_rep=2 重复到完整 64 行:
+    #     rep0 → row 0..31,  rep1 → row 32..63 (第二条 load 地址 += 32*lda)
+    #
+    #   为什么 value=8 而不是 8×4=32?
+    #     4 条 MFMA 中 A 沿 N 方向复用 — 同一份 A 数据喂两个 N 位置:
+    #       MFMA #0 (m=0,n=0) 和 #1 (m=0,n=1) 共用 A[:,0,0] (8 bf16)
+    #       MFMA #2 (m=1,n=0) 和 #3 (m=1,n=1) 共用 A[:,1,0] (8 bf16)
+    #     只需 2 个不同 A slice × 8 = 16 bf16/线程 = frag_A(8,2,1)
+    #     TV layout value=8 是单次 load 的量, M_rep=2 总共 load 2 次 = 16
+    #
+    #   stride=0 (t3) 的原因:
+    #     atom_layout (2,2,1) 把 4 个 wave 排成 (M=2, N=2) 网格:
+    #       wave 0 (tid 0-63)   → atom(M=0,N=0)
+    #       wave 1 (tid 64-127) → atom(M=1,N=0)
+    #       wave 2 (tid 128-191)→ atom(M=0,N=1)
+    #       wave 3 (tid 192-255)→ atom(M=1,N=1)
+    #     A 只关心 M 维 → 不同 N-atom 的 wave 读相同 A 数据 → stride=0
+    #     例: tid=0 和 tid=128 分属 N-atom 0/1, 但加载完全相同的 A 数据
     #
     # tiled_copy_B TV layout:
     #   ((16,4,2,2),(8,(1,1))):((1,256,0,16),(32,(0,0)))
-    #   同 A，但 stride 中 M↔N 翻转 (stride 第3项=0→N方向, 第4项=16→N_rep)
+    #   与 A 的唯一区别: t2/t3 stride 互换
+    #     t2 stride 0  — M-atom 索引对 B 无影响 (B 不关心 M)
+    #     t3 stride 16 — N-atom 索引选 B 的行块 (n+=16)
+    #   地址公式: row = t0 + t3*16, col = t1*8 + v
+    #   同理 B 沿 M 复用, 也只需 16 bf16/线程
     #
     # tiled_copy_C TV layout:
     #   ((16,8,2),((4,1),(1,1))):((32,4,512),((1,0),(0,0)))
