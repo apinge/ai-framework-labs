@@ -22,7 +22,7 @@ except ImportError:
 # │  block tile = 64×64×32, MFMA(16,16,32,BF16), 256 threads (4 waves)        │
 # │  no LDS, no preshuffle, no K-loop — block_k == K, one-shot load+compute   │
 # │                                                                             │
-# │  IR dump:  FLYDSL_DUMP_IR=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 <this>  │
+# │  IR dump:  FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR= ./small_gemm_bf16_dump FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 <this>  │
 # │  IR path:  /root/.flydsl/debug/gemm_kernel_0/                              │
 # │  Key files:                                                                 │
 # │    00_origin.mlir           — fly dialect, see all shapes/layouts           │
