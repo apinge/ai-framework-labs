@@ -301,7 +301,7 @@ wave 1 → atom(0,1) → C[ 0:16, 16:32]
 wave 2 → atom(0,2) → C[ 0:16, 32:48]
 wave 3 → atom(0,3) → C[ 0:16, 48:64]
 
-4 个 wave 沿 N 方向排列，覆盖 16×64 的 C，block=128×128 → M_rep=8, N_rep=2
+4 个 wave 沿 N 方向排列，覆盖 16×64 的 C，block=128×128 → M_rep=8, N_rep=2 
 ```
 
 IR 证据（`preshuffle_gemm_ir/00_origin.mlir` L5）：
@@ -312,6 +312,11 @@ IR 证据（`preshuffle_gemm_ir/00_origin.mlir` L5）：
 ```
 
 frag_C shape = `((4,1), 8, 2):((1,0), 8, 4)` — **M_rep=8**, N_rep=2。
+
+frag_C在ir里搜fly.mma.make_fragment 得到
+```
+%97 = fly.mma.make_fragment(c, %arg3, %37) : (!fly.tiled_mma<!fly.mma_atom<!fly_rocdl.cdna3.mfma<16x16x16, (f16, f16) -> f32>>, !fly.layout<(1,4,1):(0,1,0)>, !fly.tile<[*|*|(4,4,2):(1,8,4)]>>, !fly.memref<f16, #fly_rocdl.buffer_desc, (128,128):(?{i64 div=16},1)>) -> !fly.memref<f32, register, ((4,1),8,2):((1,0),8,4)> loc(#loc146)
+```
 
 ### 8.3 为什么 preshuffle_gemm 用 (1,4,1) 而不是 (2,2,1)
 
@@ -355,6 +360,7 @@ K_rep=4 次 MFMA, 每次消耗 K=32
 ```
 
 preshuffle_gemm 有 K-tile `(4,4,2):(1,8,4)`，K 方向**交错**排列（详见 preshuffle_explained.md §4）：
+画下来真的就是下面这个pattern
 ```
 block_k_iter=0 内的 2 次 MFMA:
   MFMA #0: k[0,1,2,3, 8,9,10,11, 16,17,18,19, 24,25,26,27]
@@ -411,3 +417,178 @@ v_mfma_f32_16x16x16_f16 v[12:15], v[98:99], v[90:91], v[12:15]   ; B=v[90:91] (k
 2. **make_tile K-tile `(4,4,2):(1,8,4)`**：把 K 方向的 MFMA 交错排列，使每个线程两次 MFMA 需要的 B 数据（8 个 f16）在内存中连续，匹配 preshuffle 的 sub_k=8 分段和 128-bit load。不用 preshuffle 的 kernel（如 small_gemm）不需要 K-tile 交错，K 方向按顺序即可。
 
 3. **三者协同**：atom_layout 决定 wave 分布 → preshuffle 决定内存排列 → K-tile 决定 MFMA 执行顺序 → 128-bit load 连接内存和寄存器。改任何一个都要相应调整其他参数。
+
+## 9. Fragment 详解：frag_A、frag_B、frag_C
+
+### 9.1 IR 定义（`00_origin.mlir` L114-116）
+
+```mlir
+-- L114: frag_A
+%95 = fly.mma.make_fragment(a, %arg3, %94)
+    -> !fly.memref<f16, register, (4, 8, (2,2)):(1, 16, (4,8))>
+
+-- L115: frag_B (stages=2)
+%96 = fly.mma.make_fragment(b, %arg3, %33, stages = 2)
+    -> !fly.memref<f16, register, (4, 2, (2,2), 2):(1, 16, (4,8), 32)>
+
+-- L116: frag_C
+%97 = fly.mma.make_fragment(c, %arg3, %37)
+    -> !fly.memref<f32, register, ((4,1), 8, 2):((1,0), 8, 4)>
+```
+
+### 9.2 frag_A: `(4, 8, (2,2)):(1, 16, (4,8))`
+
+**Python 对应**（L121）：`mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])`
+
+输入是 LDS 中的 A tile `sA[None, None, 0]` = 一个 stage 的 `(128, 64)` 矩阵。
+
+```
+dim0 = 4,  stride=1:  MFMA atom 内每 lane 的 4 个 f16（K 方向连续）
+dim1 = 8,  stride=16: M_rep = 128 / 16 = 8（M 方向 8 个 16 行 tile）
+dim2 = (2,2), stride=(4,8): K-tile 的两级结构
+    内层 2, stride=4:  K-tile dim2（交错的 2 次 MFMA，对应 block_k_iter）
+    外层 2, stride=8:  BLOCK_K=64 内有 2 个 block_k_iter（range_constexpr(64//32)=2）
+```
+
+总元素 = 4 × 8 × 4 = **128 个 f16 = 64 VGPR**。
+
+每个线程持有 A 矩阵的 8 个 M 位置 × 2 个 block_k_iter × 2 个 K-tile 交错 = 全部需要的 A 数据（一个 pipeline stage 内）。
+
+**gemm 调用时的 slice**（L155-156）：
+
+```python
+mma_frag_A[None, None, (None, block_k_iter)]
+```
+
+IR 中 slice 结果（L179）：`(4, 8, 2):(1, 16, 4)`
+
+- 选定 `block_k_iter`（0 或 1），K-tile `(2,2)` 的外层被索引 → 留下内层 2
+- 传入 fly.gemm 的是 `(4, 8, 2)` = 64 个 f16
+
+### 9.3 frag_B: `(4, 2, (2,2), 2):(1, 16, (4,8), 32)`
+
+**Python 对应**（L122）：`mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)`
+
+输入是 preshuffle 后的 global B tile `gB_k`。`stages=2` 分配双倍空间做 prefetch 双缓冲。
+
+```
+dim0 = 4,  stride=1:   MFMA atom 内每 lane 的 4 个 f16（K 方向连续）
+dim1 = 2,  stride=16:  N_rep = 128 / (4×16) = 2（N 方向重复 2 次）
+dim2 = (2,2), stride=(4,8): K-tile 两级（同 frag_A）
+dim3 = 2,  stride=32:  stages=2（pipeline 双缓冲，交替读写）
+```
+
+总元素 = 4 × 2 × 4 × 2 = **64 个 f16 = 32 VGPR**（两个 stage 各 16 VGPR）。
+
+**注意 N_rep=2 而非 8**：因为 atom_layout `(1,4,1)` 让 4 个 wave 已经覆盖了 N=64，每个 wave 只需在 N 方向重复 2 次即可覆盖 N=128。
+
+**gemm 调用时的 slice**（L156）：
+
+```python
+mma_frag_B[None, None, (None, block_k_iter), read_stage]
+```
+
+IR 中 slice 结果（L179）：`(4, 2, 2):(1, 16, 4)`
+
+- 选定 `block_k_iter` 和 `read_stage` → `(2,2)` 外层和 stages 维都被索引
+- 传入 fly.gemm 的是 `(4, 2, 2)` = 16 个 f16
+
+**retile 后**（L118）用于 buffer_load：`((8,1), 2, 2, 2):((1,0), 16, 8, 32)`
+
+```
+(8,1):   128-bit load 的 8 个 f16 + 1 个 broadcast padding
+2:       N_rep
+2:       K-tile 内的 2 次 MFMA（retile 把 (2,2) 的内层合并到 val 维）
+2:       stages
+```
+
+ISA 证据：B 的 load 和 MFMA 使用（`22_final_isa.s`）：
+
+```asm
+; load 8 f16 → 4 VGPR
+buffer_load_dwordx4 v[88:91], v76, s[16:19], 0 offen       ; N_rep=0, K-tile pair
+buffer_load_dwordx4 v[92:95], v75, s[16:19], 0 offen       ; N_rep=1, K-tile pair
+
+; MFMA 使用: v[88:89]=前4个, v[90:91]=后4个, v[92:93]/v[94:95] 同理
+v_mfma ... v[88:89] ...   ; N_rep=0, K-tile #0
+v_mfma ... v[90:91] ...   ; N_rep=0, K-tile #1
+v_mfma ... v[92:93] ...   ; N_rep=1, K-tile #0
+v_mfma ... v[94:95] ...   ; N_rep=1, K-tile #1
+```
+
+### 9.4 frag_C: `((4,1), 8, 2):((1,0), 8, 4)`
+
+**Python 对应**（L123）：`mma_frag_C = thr_mma.make_fragment_C(gC)`
+
+```
+dim0 = (4,1), stride=(1,0): 每个 MFMA atom 输出 4 个 f32（4 行 × 1 列），1 是 broadcast
+dim1 = 8,  stride=8:   M_rep = 128/16 = 8（M 方向 8 个 tile）
+dim2 = 2,  stride=4:   N_rep = 128/64 = 2（N 方向 2 次重复）
+```
+
+总元素 = 4 × 8 × 2 = **64 个 f32 = 64 VGPR**。
+
+**注意**：frag_C 没有 K 维——K 是归约维度，多次 MFMA 累加到同一组 C 寄存器。frag_C 在整个 K 循环期间不变，从 `fill(0)` 到所有 MFMA 完成后才写出。
+
+ISA 证据——C 的 VGPR 布局（`22_final_isa.s`）：
+
+```asm
+; frag_C 占 v[12:75] = 64 VGPR
+; M_rep=0, N_rep=0: v[12:15]  (4 f32)
+; M_rep=0, N_rep=1: v[16:19]
+; M_rep=1, N_rep=0: v[20:23]
+; M_rep=1, N_rep=1: v[24:27]  (虽然 stride 交错，但编译器会优化分配)
+; ...直到 M_rep=7, N_rep=1
+
+; 所有 MFMA 都累加到这 64 个 VGPR:
+v_mfma_f32_16x16x16_f16 v[12:15], v[96:97], v[88:89], v[12:15]   ; 累加到 v[12:15]
+v_mfma_f32_16x16x16_f16 v[12:15], v[98:99], v[90:91], v[12:15]   ; 再次累加到 v[12:15]
+```
+
+### 9.5 gemm 展开：每次 fly.gemm = 32 条 MFMA
+
+从 gemm slice 后的 fragment 形状：
+```
+frag_A: (4, 8, 2)  → val=4, M_rep=8, K_inner=2
+frag_B: (4, 2, 2)  → val=4, N_rep=2, K_inner=2
+frag_C: ((4,1), 8, 2) → val=4, M_rep=8, N_rep=2
+```
+
+traversal_order = KNM，展开顺序：先遍历 K，再 N，再 M：
+
+```
+for k in range(2):       # K_inner=2 (K-tile 交错的两次 MFMA)
+  for n in range(2):     # N_rep=2
+    for m in range(8):   # M_rep=8
+      MFMA(A[val, m, k], B[val, n, k], C[val, m, n])
+```
+
+总计 = 2 × 2 × 8 = **32 条 MFMA per fly.gemm**。
+
+ROCDL IR 证据（`08_convert_fly_to_rocdl.mlir`）：
+- L502~L613: 第一个 fly.gemm 的 32 条 `rocdl.mfma.f32.16x16x16f16`
+- L661~L688: 第二个 fly.gemm 的 32 条（下一个 block_k_iter）
+
+### 9.6 三者关系总结
+
+```
+                    frag_A (4,8,(2,2))       frag_B (4,2,(2,2),2)
+                    ├─ val=4: MFMA K        ├─ val=4: MFMA K
+                    ├─ M_rep=8              ├─ N_rep=2
+                    ├─ K-tile=(2,2)         ├─ K-tile=(2,2)
+                    │   ├─ 内=2: 交错MFMA   │   ├─ 内=2: 交错MFMA
+                    │   └─ 外=2: block_k    │   └─ 外=2: block_k
+                    │                       └─ stages=2: 双缓冲
+                    │
+        slice(block_k_iter, stage) ──────────────────────┐
+                    ↓                                    ↓
+               frag_A(4,8,2)                      frag_B(4,2,2)
+                    │                                    │
+                    └───── fly.gemm (KNM遍历) ──────────┘
+                              ↓
+                    32 条 v_mfma_f32_16x16x16_f16
+                              ↓
+                         frag_C ((4,1),8,2)
+                         64 f32 = 64 VGPR
+                         累加所有 K 迭代
+```
