@@ -280,7 +280,7 @@ def preshuffle_gemm(
     )
     """
     每个 workgroup 计算 C 的一个 (BLOCK_M, BLOCK_N) = (128, 128) 子块:
-      A_tile(128, 64) @ B_tile(128, 64).T = C_tile(128, 128)
+      A_tile(128, K) @ B_tile(128, K).T = C_tile(128, 128)
     block=(256,1,1) = 4 个 wave，通过 tiled_mma 的 thread layout (1,4,1):(0,1,0)
     隐式分配到 N 方向的 4 个 16×16 MFMA tile（thr_mma.thr_slice(tid) 完成分工，
     无需手写 wave_id 分支）。

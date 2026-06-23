@@ -6,8 +6,11 @@ BLOCK_N = 128
 BLOCK_K = 64
 
 每个workgroup要解决 C_tile = A_tile @ B_tile.T
-即 A_tile(128, 64) @ B_tile(128, 64).T = C_tile(128, 128)。
-其中 A_tile 是 A 沿 M 方向的子块，B_tile 是 B 沿 N 方向的子块（代码 L87: `gB_k = fx.flat_divide(B, (BLOCK_N, BLOCK_K))`）。
+即 A_tile(128, K) @ B_tile(128, K).T = C_tile(128, 128)。
+其中 A_tile 是 A 沿 M 方向取 128 行、K 方向全部，B_tile 是 B 沿 N 方向取 128 行、K 方向全部。
+
+沿 K 方向按 BLOCK_K=64 切分后，变成累加：
+C_tile(128, 128) = Σ_{k=0}^{K/64-1} A_tile_k(128, 64) @ B_tile_k(128, 64).T
 
 还记得我们的B是preshuffle过的吗
 
@@ -604,3 +607,279 @@ mma_frag_B (reg):  ┌─stage0──┐  ┌─stage1──┐  ┌─stage0─
 关键：**A 走 global→reg→LDS→reg→MMA（三跳），B 走 global→reg→MMA（两跳）**。
 A 需要 LDS 是因为 row-major A 沿 M 方向分发给不同 lane 需要转置（通过 LDS swizzle 消除 bank conflict）。
 B 经过 preshuffle 后内存布局已经 MFMA 友好，直接 buffer_load 到寄存器即可。
+
+---
+
+## Pipeline 全局视角：从计算需求到流水线
+
+### 1. Workgroup 的任务
+
+一个 workgroup（256 个线程）需要计算：
+
+```
+C_tile(128×128) = Σ_{k=0}^{K/64-1}  A_tile(128×64) @ B_tile(128×64).T
+```
+
+K=4096 时有 64 个 k-tile，每个 k-tile 做一次 128×128×64 的矩阵乘累加。
+
+### 2. MFMA 16×16×16 能做什么
+
+一条 `v_mfma_f32_16x16x16_f16` 指令：
+- 输入：A_sub(16×16, f16) 和 B_sub(16×16, f16)
+- 输出：C_sub(16×16, f32) += A_sub @ B_sub.T
+- 消耗 K=16 列
+
+所以一个 128×128×64 的 tile 需要拆成很多次 MFMA。
+
+### 3. 拆分方式
+
+```
+C_tile(128×128) 切成 8×8 = 64 个 C_sub(16×16)
+
+每个 C_sub 需要：
+  for k_chunk in range(2):          # BLOCK_K=64 分成 2 个 32 列的 chunk (列 [0:32] 和 [32:64])
+    for k_rep in range(2):         # 每 32 列再交错拆成 2 次 MFMA（K-tile layout, 每次 MMA_K=16）
+      C_sub += A_sub(16×16) @ B_sub(16×16).T
+
+= 每个 C_sub 做 2×2 = 4 次 MFMA (其实可以这样理解 BLOCK_K = 64的范围内 不管是不是交错 用16x16x16 总归要做四次mfma)
+= 64 个 C_sub × 4 = 256 次 MFMA / k-tile
+= 256 × 64 k-tiles = 16384 次 MFMA / workgroup
+```
+
+但 256 个线程共享 MFMA 单元（一条 MFMA 用满 64 lane = 1 wave），
+一个 workgroup 有 256/64 = 4 个 wave。
+
+#### tiled_mma 的排列 `(1, 4, 1):(0, 1, 0)` 怎么切分
+
+`make_tiled_mma` 的第二个参数 `(1, 4, 1):(0, 1, 0)` 的三个维度是 **(M_waves, N_waves, K_waves)**：
+
+```
+M_waves = 1   stride=0  → M 方向不分 wave，靠 repeat 覆盖
+N_waves = 4   stride=1  → 4 个 wave 沿 N 方向排列
+K_waves = 1   stride=0  → K 方向不分 wave
+```
+
+4 个 wave 的分工：
+
+```
+                  N=0..31     N=32..63    N=64..95    N=96..127
+                 ┌──────────┬──────────┬──────────┬──────────┐
+  M=0..127       │  wave 0  │  wave 1  │  wave 2  │  wave 3  │
+  (128 行全部)    │ 128×32   │ 128×32   │ 128×32   │ 128×32   │
+                 └──────────┴──────────┴──────────┴──────────┘
+```
+
+每个 wave 的 128×32 再按 MMA atom (16×16) 切成 repeat：
+
+```
+每个 wave:
+  M 方向: 128 / 16 = 8 个 M-tile  (repeat)
+  N 方向:  32 / 16 = 2 个 N-tile  (repeat)
+  → 8 × 2 = 16 个 C_sub(16×16) / wave
+
+4 waves × 16 = 64 个 C_sub = 完整 128×128  ✓
+```
+
+展开看 wave 0 的 16 个 C_sub：
+
+```
+wave 0 (N=0..31):                    wave 1 (N=32..63):
+    N=0..15   N=16..31                   N=32..47  N=48..63
+   ┌────────┬────────┐                  ┌────────┬────────┐
+M0 │ sub00  │ sub01  │               M0 │ sub00  │ sub01  │
+M16│ sub10  │ sub11  │               M16│  ...   │  ...   │
+M32│ sub20  │ sub21  │                  │        │        │
+M48│ sub30  │ sub31  │                  │        │        │
+M64│ sub40  │ sub41  │                  │        │        │
+M80│ sub50  │ sub51  │                  │        │        │
+M96│ sub60  │ sub61  │                  │        │        │
+M112│sub70 │ sub71  │                  │        │        │
+   └────────┴────────┘                  └────────┴────────┘
+   wave 2, wave 3 同理覆盖 N=64..127
+```
+
+MFMA 次数统计：
+
+```
+每个 C_sub 每个 k-tile:      4 次 MFMA (2 k_chunk × 2 k_rep)
+每个 wave 每个 k-tile:       16 C_sub × 4 = 64 条 MFMA
+每个 workgroup 每个 k-tile:  4 waves × 64 = 256 条 MFMA (4 wave 并行, wall-clock = 64)
+全部 k-tiles:                64 条/wave × 64 k-tiles = 4096 条 MFMA/wave
+```
+
+### 4. 伪代码（不含 API 细节，纯计算逻辑）
+
+```python
+# ═══════════════════════════════════════════════════════
+# Preshuffle GEMM —— 单 workgroup 伪代码
+# 256 threads, 4 waves, MFMA 16×16×16
+# ═══════════════════════════════════════════════════════
+
+# ── 常量 ──
+BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+MMA_M, MMA_N, MMA_K = 16, 16, 16
+K_TILES = K // BLOCK_K            # 64 (when K=4096)
+M_MMAS  = BLOCK_M // MMA_M       # 8
+N_MMAS  = BLOCK_N // MMA_N       # 8 (4 waves × 2 repeats)
+K_CHUNKS = BLOCK_K // 32         # 2  (block_k_iter = 0, 1)
+K_REPS  = 32 // MMA_K            # 2  (K-tile 交错, 见 preshuffle_explained.md)
+# 每个 wave 负责 N 的 1/4 → N_per_wave = 32, 即 2 个 MMA_N
+
+# ── 本 workgroup 的数据切片 ──
+A_wg = A[bid_x*128 : (bid_x+1)*128,  :]    # (128, K)
+B_wg = B[bid_y*128 : (bid_y+1)*128,  :]    # (128, K), preshuffle 过
+C_wg = C[bid_x*128 : (bid_x+1)*128,
+         bid_y*128 : (bid_y+1)*128]         # (128, 128)
+
+# ── 存储分配 ──
+C_acc[8][2] = zeros(16×16, f32)   # 每 wave: 8 M-tile × 2 N-tile = 16 个 16×16 块
+                                   # 4 waves 合计 = 64 个 C_sub → 覆盖完整 128×128
+sA = LDS[2][128][64]              # 双缓冲, K-major, swizzle S<3,3,3>
+                                   # 大小 = 2 × BLOCK_M × BLOCK_K × 2B = 32768 字节
+                                   # 为什么是完整的 BLOCK_M=128 行？
+                                   # 因为 4 wave 沿 N 切分，M 方向不切分——
+                                   # 每个 wave 都要读 A 的全部 128 行，LDS 是 workgroup
+                                   # 内共享的，写一次 4 个 wave 都能读
+A_reg_buf = VGPR[...]             # copy_frag_A: 中转寄存器 (global→LDS 中转站)
+B_reg[2] = VGPR[...]              # mma_frag_B: 双缓冲 (global→reg 直达)
+                                   # 每个 wave 只需 B 的 32 行（自己负责的 N 区间），
+                                   # wave 之间不共享 B，直接 buffer_load 到各自 VGPR
+
+# ═══════════════════════════════════════════════════════
+# Prologue: 预取第 0 个 k-tile
+# ═══════════════════════════════════════════════════════
+A_reg_buf = buffer_load(A_wg[:, 0:64])       # global → reg (每 thread 8 f16)
+B_reg[0]  = buffer_load(B_wg[:, 0:64])       # global → reg (preshuffle: 合并访问)
+C_acc[:][:]  = 0
+ds_write(sA[0], A_reg_buf)                   # reg → LDS stage 0
+barrier()                                     # 等所有 thread 写完 LDS
+
+# ═══════════════════════════════════════════════════════
+# Main loop: k=0 .. K_TILES-1, 每次处理 BLOCK_K=64 列
+# 双缓冲: read_stage 和 write_stage 交替 0↔1
+# ═══════════════════════════════════════════════════════
+for k in range(K_TILES):
+    read_stage  = k % 2
+    write_stage = 1 - read_stage
+
+    # ── Step 1: 发射下一个 k-tile 的预取 (异步, 不等结果) ──
+    if k < K_TILES - 1:
+        A_reg_buf = buffer_load(A_wg[:, (k+1)*64 : (k+2)*64])  # → A_reg_buf
+        B_reg[write_stage] = buffer_load(B_wg[:, (k+1)*64 : (k+2)*64])  # → B_reg 另一槽
+
+    # ── Step 2: 用当前 k-tile 的数据做 MMA ──
+    for k_chunk in range(K_CHUNKS):    # 0, 1 → 处理 k 列 [0:32] 和 [32:64]
+
+        # 从 LDS 读 A 到 MMA 寄存器 (swizzle 消除 bank conflict)
+        A_mma = ds_read(sA[read_stage], k_chunk)   # 每 thread 按 MFMA layout 读
+
+        # 执行 MFMA (每 wave)
+        for m in range(M_MMAS):          # 8 个 M-tile
+            for n in range(N_per_wave // MMA_N):  # 2 个 N-tile
+                for kr in range(K_REPS):  # 2 次交错 MFMA
+                    # ── 这就是一条 v_mfma_f32_16x16x16_f16 ──
+                    C_acc[m][n] += A_mma[m][kr] @ B_reg[read_stage][n][kr].T
+                    #              ^^^16×16 f16    ^^^16×16 f16 (preshuffle 保证合并读)
+
+    # ── Step 3: 把预取的 A 写入 LDS 的另一个 stage ──
+    if k < K_TILES - 1:
+        ds_write(sA[write_stage], A_reg_buf)
+        barrier()    # 等所有 thread 写完, 下一轮才能从 write_stage 读
+
+# ═══════════════════════════════════════════════════════
+# Epilogue: 把 C_acc (f32) 截断为 f16, 写回 global
+# ═══════════════════════════════════════════════════════
+C_f16 = trunc_f32_to_f16(C_acc)
+buffer_store(C_f16, C_wg)
+```
+
+### 5. 实际代码 vs 伪代码的对应
+
+| 伪代码 | 实际代码 (preshuffle_gemm.py) | 说明 |
+|---|---|---|
+| `buffer_load(A)` → `A_reg_buf` | `fx.copy(buffer_copy_128b, thr_gA_k[...,0], copy_frag_A, soffset=...)` | soffset 偏移选 k-tile |
+| `buffer_load(B)` → `B_reg[stage]` | `fx.copy(buffer_copy_128b, thr_gB_k[...,0], mma_frag_B_retile[...,stage], soffset=...)` | B 直接到 MMA 寄存器 |
+| `ds_read(sA)` → `A_mma` | `fx.copy(uni_copy_128b, thr_sA_s2r[...,k_chunk,stage], mma_frag_A_retile[...,k_chunk])` | retile = 同一块 VGPR 的 MMA 视图 |
+| `MFMA(A, B)` → `C_acc` | `fx.gemm(tiled_mma, C, A[..., (*, k_chunk)], B[..., (*, k_chunk), stage], C)` | 展开为 8×2×2=32 条 MFMA |
+| `ds_write(sA, A_reg_buf)` | `fx.copy(uni_copy_128b, copy_frag_A, thr_sA[..., write_stage])` | reg → LDS |
+| `barrier()` | `fx.gpu.barrier()` | |
+| `trunc + store` | L248-251 | f32→f16 + buffer_store |
+
+### 6. 为什么 A 走 LDS 而 B 不走
+
+```
+A (row-major):                          B (preshuffle):
+┌─────────────────────┐                ┌─────────────────────┐
+│ M=128 行, K=64 列    │                │ 已按 MFMA lane 排好  │
+│ 每行 K 连续           │                │ 每 thread 的 8 f16   │
+│                     │                │ 在内存中连续          │
+│ MFMA 要沿 M 分 lane  │                │                     │
+│ → 直接读不合并       │                │ → 直接 buffer_load   │
+│ → 需要 LDS 转置      │                │   就是合并的          │
+└─────────────────────┘                └─────────────────────┘
+     global → reg → LDS → reg → MMA         global → reg → MMA
+         3 跳，有 LDS swizzle                  2 跳，无 LDS
+```
+
+这个选择和 wave 切分方式 `(1, 4, 1)` 直接相关：
+
+```
+              wave 0      wave 1      wave 2      wave 3
+              N=0..31     N=32..63    N=64..95    N=96..127
+             ┌──────────┬──────────┬──────────┬──────────┐
+M=0..127     │ 128×32   │ 128×32   │ 128×32   │ 128×32   │
+             └──────────┴──────────┴──────────┴──────────┘
+
+A(128×64):  4 waves 全用同一份 A (M 方向不切)  → 放 LDS, 写一次 4 wave 共享读
+B(128×64):  每 wave 只用自己的 32 行 B          → 放 VGPR, 各 wave 独立 buffer_load
+```
+
+如果反过来 wave 沿 M 切 `(4,1,1)`，A 每 wave 只需 32 行（LDS 可以小 4 倍），但 B 就要
+4 wave 共享 → 得放 LDS。这个 kernel 选沿 N 切，是因为 B preshuffle 后可以直接合并读到
+VGPR（不需要 LDS 转置），而 A 是 row-major 需要 LDS 做 layout 转换，所以把 LDS 留给 A。
+
+### 7. 一条 MFMA 到底在算什么
+
+```
+v_mfma_f32_16x16x16_f16  v[C], v[A], v[B], v[C]
+
+64 个 lane 协作：
+- lane i 提供 A 的第 i%16 行的 4 个 f16 (K 方向连续 4 个)
+- lane i 提供 B 的第 i%16 行的 4 个 f16
+- 硬件内部完成 16×16×16 → 16×16 的外积累加
+- 结果：lane i 得到 C 的第 i%16 行中 4 个 f32
+```
+
+### 8. 每个 pipeline stage 的 MFMA 次数
+
+```
+block_k_iter=0:  K 列 [0:32], 展开为:
+  8 (M-tiles) × 2 (N-tiles/wave) × 2 (K-reps) = 32 次 MFMA (per wave)
+  × 4 waves = 128 次 MFMA (per workgroup)
+  但！4 waves 是并行的，所以 wall-clock = 32 MFMA
+
+block_k_iter=1:  K 列 [32:64], 同理 32 次 MFMA
+
+合计每个 pipeline stage: 64 MFMA (per wave, wall-clock)
+全部 64 k-tiles: 64 × 64 = 4096 MFMA (per wave)
+```
+
+### 9. 简化版本——如果没有流水线
+
+```python
+# 没有流水线的朴素版本 (不实际, 但帮助理解)
+C_acc = zeros(128, 128, f32)
+for k in range(K_TILES):
+    A_tile = load_from_global(A_wg[:, k*64:(k+1)*64])   # 等很久...
+    B_tile = load_from_global(B_wg[:, k*64:(k+1)*64])   # 等很久...
+    write_to_LDS(sA, A_tile)
+    barrier()
+    for k_chunk in range(2):
+        A_mma = read_from_LDS(sA, k_chunk)
+        C_acc += A_mma @ B_tile.T    # MFMA
+store_to_global(C_wg, f16(C_acc))
+```
+
+流水线版本的核心优化：**在做当前 k-tile 的 MFMA 时，同时 buffer_load 下一个 k-tile 的数据**。
+global memory 延迟约 400 cycle，一条 MFMA 约 64 cycle；32 条 MFMA ≈ 2048 cycle，
+足够隐藏 buffer_load 的延迟。双缓冲保证读写不冲突。
