@@ -92,7 +92,7 @@ def gemm_kernel(
 
     uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float16)
     buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float16)
-    buffer_copy_16b = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.Float16)
+    buffer_copy_16b = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.Float16) # buffer_store_short
 
     thr_copy_s2r_A = fx.make_tiled_copy_A(buffer_copy_128b, tiled_mma).get_slice(tid)
     thr_copy_g2r_B = fx.make_tiled_copy_B(buffer_copy_128b, tiled_mma).get_slice(tid)
@@ -109,27 +109,63 @@ def gemm_kernel(
     )
     sA = fx.make_view(fx.get_dyn_shared(fx.Float16), composed_layout_A)  # (BM, BK, STAGES_A)
 
+    # ---- partition: view into existing memory (global / LDS), no new allocation ----
+    #                                          (VA,    VM, VK, k)
+    # IR → buffer_desc, ((8,1),4,1,?):((1,0),?{div=512},0,64)
+    #   VA=8 f16/load, VM=4 M-blocks, VK=1 K-block, k=? k-tiles
     thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, k)
-    thr_sA = thr_copy_g2s_A.partition_D(sA)  # (VA, VM, VN, STAGES_A)
+    #                                          (VA,    VM,   VK, STAGES)
+    # IR → shared, S<3,3,3> o ?{div=8} o ((8,1),4,1,2):((1,0),2048,0,8192)
+    #   same (VA,VM,VK) as src; last dim = 2 stages
+    thr_sA = thr_copy_g2s_A.partition_D(sA)  # (VA, VM, VK, STAGES_A)
 
+    # s2r (different thread layout from g2s, matches MFMA lane mapping):
+    #                                          (VA,    VM, VK, STAGES)
+    # IR → shared, S<3,3,3> o ?{div=8} o ((8,1),8,2,2):((1,0),1024,32,8192)
+    #   VA=8, VM=8 M-blocks(128/16), VK=2 K-iters(64/32), 2 stages
+    #   VM stride=1024=16×64(M-tile × sA的K-major行宽), VK stride=32=32×1(K-tile宽 × K stride=1)
     thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, STAGES_A)
+    # g2r (B skips LDS — preshuffle already made it coalesced):
+    #                                          (VB,    VN, VK, k)
+    # IR → buffer_desc, ((8,1),2,2,64):((1,0),262144,512,1024)
+    #   VB=8, VN=2 N-blocks, VK=2 K-iters, k=64 k-tiles
     thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)  # (VB, VN, VK, k)
+    # r2g (16-bit store for writing C back):
+    #                                          (VC,          VM,         VN)
+    # IR → buffer_desc, ((1,4),8,2):((0,?{div=16}),?{div=256},64)
+    #   VC=(1,4), VM=8 M-blocks, VN=2 N-blocks
     thr_gC = thr_copy_r2g_C.partition_S(gC)  # (VC, VM, VN)
 
-    copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])  # (VA, VM, VN)
+    # ---- fragment: real VGPR allocation ----
+    #                                          (VA,    VM, VK)
+    # IR → register, ((8,1),4,1):((1,0),8,0)  — 32 f16 = 4 VGPR, g2s staging buffer
+    copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])  # (VA, VM, VK)
 
-    mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])  # (VA, VM, VN)
-    mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)  # (VB, VM, VK, 2)
+    #                                          (VA, VM, VK)
+    # IR → register, (4,8,(2,2)):(1,16,(4,8))  — 128 f16 = 16 VGPR
+    #   VA=4 f16/lane, VM=8 M-tiles(128/16), VK=(2 k_repeat, 2 block_k_iter)
+    mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])  # (VA, VM, VK)
+    #                                          (VB, VN, VK, stages)
+    # IR → register, (4,2,(2,2),2):(1,16,(4,8),32)  — 64 f16 = 8 VGPR
+    #   VB=4 f16/lane, VN=2 N-tiles, VK=(2,2) K, stages=2 (reg double-buffer)
+    mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)  # (VB, VN, VK, 2)
+    #                                          (VC,    VM, VN)
+    # IR → register, ((4,1),8,2):((1,0),8,4)  — 64 f32 = 64 VGPR (accumulator)
+    #   VC=4 f32/MFMA output, VM=8 M-tiles, VN=2 N-tiles
     mma_frag_C = thr_mma.make_fragment_C(gC)  # (VC, VM, VN)
 
     mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
     mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
 
-    gA_k_stride = fx.get_scalar(gA_k.stride[2])
-    gB_k_stride = fx.get_scalar(gB_k.stride[2])
+    gA_k_stride = fx.get_scalar(gA_k.stride[2]) # 64， gA_k.stride= (4096d,1,64)
+    gB_k_stride = fx.get_scalar(gB_k.stride[2]) # 1024 gB_k.stride =((8,65536),(1,128),1024)
 
-    gA_k_stride = fx.get_scalar(gA_k.stride[2])
-    gB_k_stride = fx.get_scalar(gB_k.stride[2])
+    if DDD:
+        bid = fx.block_idx.x
+        z = fx.Int32(0)
+        if (bid == z) & (tid == z):
+            fx.printf("gA_k_stride {}",gA_k.stride)
+            fx.printf("gB_k_stride {}",gB_k.stride)
 
     def run_pipeline_stage(read_stage, next_k, read_next=True):
         write_stage = read_stage ^ 1
@@ -226,14 +262,17 @@ def preshuffle_gemm(
     preshuffle_B = fx.Tensor(fx.make_view(fx.get_iter(B), preshuffle_layout_B))
 
     val_per_thr = 8  # 16B / f16
-    thrs_col = BLOCK_K // val_per_thr
-    thrs_row = 256 // thrs_col
+    thrs_col = BLOCK_K // val_per_thr #8 
+    thrs_row = 256 // thrs_col #32
 
     tiled_copy_g2s_A = fx.make_tiled_copy(
         fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float16),
+        # fx.make_layout(((8, 32), (1, 8)), ((32 * 8, 1), (1, 32)))
         fx.make_layout(((thrs_col, thrs_row), (1, val_per_thr)), ((thrs_row * val_per_thr, 1), (1, thrs_row))),
         fx.make_tile(thrs_row, BLOCK_K),
     )
+    if DDD:
+        fx.utils.print_typst(tiled_copy_g2s_A, file="preshuffle_gemm_tiled_copy_g2s_A.typ")
     tiled_mma = fx.make_tiled_mma(
         fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.Float16)),
         fx.make_layout((1, 4, 1), (0, 1, 0)),
