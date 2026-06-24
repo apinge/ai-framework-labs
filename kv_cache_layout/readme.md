@@ -95,6 +95,22 @@ class MHATokenToKVPool(KVCache):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 ```
+
+注意这里 对于普通的MHA(含GQA)且TP的情况 每张卡存的是 被切出来的head 而不是完整的head [model_runner_kv_cache_mixin.py](https://github.com/sgl-project/sglang/blob/5338e4448300c5bf131f77a9308b0d0757e8ce84/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py#L793)
+
+```python
+    def get_num_kv_heads(self, tensor_parallel_size) -> int:
+        """Returns the number of KV heads per GPU."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        # If tensor parallelism is used, we divide the number of KV heads by
+        # the tensor parallel size. We will replicate the KV heads in the
+        # case where the number of KV heads is smaller than the tensor
+        # parallel size so each GPU has at least one KV head.
+        return max(1, total_num_kv_heads // tensor_parallel_size)
+```
+注意MLA目前的sglang的实现不是这样按head切分别存，有另外的实现。
+
+
 page-size影响的是allocator
 ```python
     if self.page_size == 1:
