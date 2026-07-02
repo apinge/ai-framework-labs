@@ -1,5 +1,6 @@
 # quantization
 
+Demo: [`pertoken_quant_fp8_demo.py`](./pertoken_quant_fp8_demo.py)
 ## per token quant
 
 
