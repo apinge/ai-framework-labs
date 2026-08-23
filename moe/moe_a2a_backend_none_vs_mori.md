@@ -343,7 +343,9 @@ buffer.dispatch(x, topk_idx=topk_ids, ...)
 
 所以 `mori/deepep` 的 MoE core 输入不是原始完整 `[T, H]`，而是已经按 expert owner 收到的 packed token hidden。
 
-## Profile
+## Profile 
+
+我们暂时只关注prefill阶段
 
 `--moe-a2a-backend none` 没有combine和dispatch只有最后的rccl all reduce
 ![a2a backend none](./ep_a2a_backend_none.png)
@@ -352,6 +354,7 @@ buffer.dispatch(x, topk_idx=topk_ids, ...)
 `--moe-a2a-backend mori` 有dispatch和combine
 ![a2a backend mori](./ep_a2a_backend_mori.png)
 
+首先两个EP都有moe sorting kernel 是两个`void aiter::opus_moe_sorting_entry` (用的和TP的常见的不止一个`void ck_tile::kentry<2, ck_tile::MoeSortingMultiPhaseKernel_P23` 不同)，moe_soting kernel无论TP还是EP从profile看上去都有不止一个gpu kernel，后面会解释。
 
 两种情况 moe都是`aiter::fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_ps_32x512`
 
@@ -609,6 +612,296 @@ mori:
 ```
 
 这也解释了为什么 `--moe-a2a-backend none` 的 MoE kernel 可能更长：它不是单纯“省掉 dispatch/combine 后的同一份计算”，而是走了另一套 `StandardDispatcher + fused shared expert + post reduce` 的数据流。
+
+### `--moe-a2a-backend mori` 的 moe_sorting
+
+这里容易误会：Mori path 里有两层“整理 token”的动作，它们不是同一件事。
+
+```text
+1. Mori dispatch:
+   EP 通信层面的 token routing / receive packing。
+
+2. AITER moe_sorting:
+   本地 fused_moe kernel 计算层面的 expert 分组 / TILE_M padding / launch table。
+```
+
+也就是说，Mori dispatch 负责把 token 从原 rank 发到 expert owner rank，并返回本 rank收到的 expert input：
+
+```python
+# sglang/srt/layers/moe/token_dispatcher/moriep.py
+(
+    packed_recv_hidden,
+    recv_topk_weights,
+    recv_scales,
+    recv_topk_ids,
+    packed_recv_count,
+) = self.mori_op.dispatch(
+    hidden_states,
+    topk_weights,
+    scale,
+    topk_ids,
+    call_local_expert_count=record,
+)
+```
+
+这些东西会被包装成 `MoriEPNormalDispatchOutput`：
+
+```text
+hidden_states              = packed_recv_hidden
+topk_ids                   = recv_topk_ids
+topk_weights               = recv_topk_weights
+num_recv_tokens_per_expert = packed_recv_count
+origin_topk_ids            = 原始 topk_ids，给 combine 用
+origin_topk_weights        = 原始 topk_weights，给 combine 用
+```
+
+然后进入 AITER runner 前，SGLang 的 pre-permute 会把 Mori dispatch 的信息转成 AITER fused_moe 的输入：
+
+```python
+# sglang/srt/layers/moe/moe_runner/aiter.py
+hidden_states = dispatch_output.hidden_states
+topk_ids = dispatch_output.topk_ids.to(torch.int32)
+topk_weights = dispatch_output.topk_weights.to(torch.float32)
+num_local_tokens = dispatch_output.num_recv_tokens_per_expert
+```
+
+注意这里 `num_local_tokens` 很关键，它来自 Mori 的 `packed_recv_count`，表示每个 local expert 收到多少 token。它会继续传给 AITER fused_moe，用于量化/排序/GEMM 的有效行数处理。
+
+同时 Mori dispatcher 也会为 AITER 构造 `expert_mask_gpu`，因为 Mori 返回的 `recv_topk_ids` 仍按 global expert id 表示。这个 mask 的作用不是做跨 rank dispatch，而是在本 rank fused_moe sorting 时把 global expert id 限定到当前 rank 持有的 local expert 范围。
+
+但是 Mori dispatch 之后，AITER fused_moe 里面仍然会调用 `moe_sorting`。这个 `moe_sorting` 就是 `/sgl-workspace/ai-framework-labs/moe/readme.md` L184-L227 讨论的那类东西：把 `topk_ids/topk_weights` 处理成 expert-major、按 `TILE_M` padding 的 launch 表。
+
+调用链大致是：
+
+```text
+Mori dispatcher
+  -> mori_op.dispatch(...)
+       得到 packed_recv_hidden / recv_topk_ids / recv_topk_weights / packed_recv_count
+  -> AITER pre_permute
+       num_local_tokens = packed_recv_count
+  -> aiter.fused_moe(...)
+       -> moe_sorting(...)
+            生成 sorted_ids / sorted_weights / sorted_expert_ids / num_valid_ids / moe_buf
+       -> fmoe_g1u1(... sorted_ids, sorted_expert_ids, num_valid_ids ...)
+  -> mori_op.combine(...)
+```
+
+AITER 代码里可以看到：
+
+```python
+# aiter/fused_moe.py
+sorting_ret = moe_sorting(
+    topk_ids,
+    topk_weight,
+    global_E,
+    model_dim,
+    dtype,
+    block_size_M,
+    expert_mask,
+    num_local_tokens,
+    ...
+)
+
+fmoe_func(
+    moe_buf,
+    a1,
+    w1,
+    w2,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    topk,
+    ...
+)
+```
+
+所以和 readme 里那个 sorting 的关系是：
+
+```text
+readme L184-L227 的 moe_sorting:
+  给本地 fused_moe/GEMM 准备 sorted_ids、sorted_expert_ids、num_valid_ids。
+
+Mori dispatch:
+  给 EP 准备跨 rank token 搬运和 receive packing。
+
+Mori path 里的 AITER moe_sorting:
+  仍然是 readme 那种本地 kernel sorting，
+  只是它的输入已经不是原始 [T, H] token batch，
+  而是 Mori dispatch 后的 packed_recv_hidden / recv_topk_*。
+```
+
+这里可以这样理解：
+
+```text
+Mori dispatch 解决“token 应该去哪个 rank”的问题。
+AITER moe_sorting 解决“到了这个 rank 后，怎么按 expert/tile 喂给 fused GEMM”的问题。
+```
+
+这也是为什么 Mori path trace 里仍然能看到 AITER `fmoe_g1u1` 和相关 sorting kernel。Mori 并没有替代 AITER fused_moe 内部的 `moe_sorting`；它只是把 fused_moe 的输入从 `none` 路径的完整 `[8000, H]`，换成了 EP dispatch 后的 receive/packed buffer。
+
+### 为什么 `opus_moe_sorting_entry` 看起来有多个 GPU kernel？
+
+我现在的理解是：`void aiter::opus_moe_sorting_entry<...>` 不是一个具体 sorting 算法的唯一名字，它更像 AITER Opus sorting 的统一 kernel wrapper。
+
+源码里这个 wrapper 很薄：
+
+```cpp
+// aiter/csrc/include/moe_sorting_opus.h
+template <typename Kernel, typename Kargs>
+__global__ void __launch_bounds__(1024) opus_moe_sorting_entry(Kargs kargs)
+{
+    Kernel{}.operator()(kargs);
+}
+```
+
+真正的区别在尖括号里的 `Kernel` 类型。例如 trace 里这些名字虽然都以 `opus_moe_sorting_entry` 开头，但它们不是同一个 phase：
+
+```text
+MoeSortingClearWorkspaceKernel
+MoeSortingMultiPhaseKernel_P0_v1
+MoeSortingMultiPhaseKernel_P1
+MoeSortingMultiPhaseKernel_P23
+```
+
+也就是说，profiler 里看到多个 `void aiter::opus_moe_sorting_entry<...>`，不代表 SGLang 做了多次完整 MoE sorting；更准确地说，是一次 `aiter::moe_sorting_opus_fwd` 被 AITER 拆成了多个 GPU phase。
+
+AITER 的 Python 入口是：
+
+```python
+# aiter/fused_moe.py
+ws_size = aiter.moe_sorting_opus_get_workspace_size(
+    M, num_experts, topk, dispatch_policy
+)
+workspace = torch.empty(ws_size, dtype=torch.uint8, device=device) if ws_size > 0 else None
+
+aiter.moe_sorting_opus_fwd(
+    topk_ids,
+    topk_weights,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_buf,
+    num_experts,
+    int(block_size),
+    expert_mask,
+    num_local_tokens,
+    workspace,
+    dispatch_policy,
+    local_topk_ids,
+)
+```
+
+C++ binding 里会固定把 `clear_workspace_inside_api` 传成 `true`：
+
+```cpp
+// aiter/csrc/py_itfs_cu/moe_sorting_opus_kernels.cu
+moe_sorting_opus(
+    {
+        dtype_str,
+        "fp32",
+        local_expert_mask.has_value(),
+        true,
+        dispatch_policy
+    },
+    ...
+)
+```
+
+所以当走 multi-phase path，并且 workspace 非空时，sorting 前面通常还会多一个 clear workspace kernel。
+
+源码里选择路径的逻辑大概是：
+
+```cpp
+// aiter/csrc/include/moe_sorting_opus.h
+if (moe_sorting_opus_get_workspace_size(
+        a.tokens, a.num_experts, a.topk, t.dispatch_policy) != 0) {
+    return moe_sorting_opus_mp(t, a, s);
+}
+```
+
+进入 `moe_sorting_opus_mp` 后：
+
+```text
+tokens < 2048:
+  launch P0_v2 + P23
+
+tokens >= 2048:
+  launch maybe_clear_workspace + P0_v1 + P1 + P23
+```
+
+这里 `maybe_clear_workspace` 因为上面 binding 里传了 `clear_workspace_inside_api=true`，实际会 launch `MoeSortingClearWorkspaceKernel`。
+
+所以如果只看 profiler 中的短名字：
+
+```text
+void aiter::opus_moe_sorting_entry
+void aiter::opus_moe_sorting_entry
+...
+```
+
+会感觉“为什么有两个/多个 sorting kernel”。但展开完整 kernel 名后，含义是：
+
+```text
+P0/P1/P23 是同一次 sorting 的不同阶段。
+不是 dispatch 一次 sort、fused_moe 又 sort 一次。
+也不是每个 expert 单独 launch 一个 sort kernel。
+```
+
+结合这次 trace：
+
+```text
+mori prefill:
+  aiter::moe_sorting_opus_fwd input:
+    topk_ids/topk_weights = [32768, 10]
+    expert_mask           = [512]
+    num_local_tokens      = [1]
+    workspace             = [16779520]
+
+  一个 external id 下看到:
+    MoeSortingClearWorkspaceKernel
+    MoeSortingMultiPhaseKernel_P0_v1
+    MoeSortingMultiPhaseKernel_P1
+    MoeSortingMultiPhaseKernel_P23
+
+none prefill:
+  aiter::moe_sorting_opus_fwd input:
+    topk_ids/topk_weights = [8000, 11]
+    expert_mask           = [513]
+    workspace             = [4106304]
+
+  同样可以看到:
+    MoeSortingClearWorkspaceKernel
+    MoeSortingMultiPhaseKernel_P0_v1
+    MoeSortingMultiPhaseKernel_P1
+    MoeSortingMultiPhaseKernel_P23
+```
+
+这里 `none` 的 `[8000, 11]` 是因为 fused shared expert 时 routed top-k 10 后面又拼了 shared expert，所以 topk 维度变成 11；`mori` 的 `[32768, 10]` 是 Mori/EP packed buffer 容量路径，shared expert fusion 在这个路径没有拼进去。
+
+这些 phase 可以先用非常粗的方式理解：
+
+```text
+P0:
+  扫 topk_ids，统计/标记 token-expert pair 属于哪个 expert。
+
+P1:
+  做中间 offset / prefix / workspace 整理。
+
+P23:
+  真的产出 sorted_token_ids、sorted_weights、sorted_expert_ids，
+  并按 TILE_M 补 padding，给后面的 fmoe GEMM 用。
+
+ClearWorkspace:
+  清掉 multi-phase 需要复用的 workspace。
+```
+
+这个阶段划分只是为了帮助理解 profile，不需要把它想成四个业务逻辑步骤。业务逻辑上它仍然是在做一件事：
+
+```text
+把 topk_ids/topk_weights 变成本地 fused_moe 能消费的 expert-major 排列。
+```
 
 ### 什么时候 `none` 可能更好？
 
