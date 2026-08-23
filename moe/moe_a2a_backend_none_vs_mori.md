@@ -585,7 +585,7 @@ none:
 mori:
   routed experts 走 dispatch/combine
   local expert count = 128
-  shared expert 可能走 separate MLP
+  这个 Qwen profile 里 shared expert 走 separate MLP
   dispatch 后的 hidden_states 是 backend 准备好的 buffer / packed view
 ```
 
@@ -612,6 +612,165 @@ mori:
 ```
 
 这也解释了为什么 `--moe-a2a-backend none` 的 MoE kernel 可能更长：它不是单纯“省掉 dispatch/combine 后的同一份计算”，而是走了另一套 `StandardDispatcher + fused shared expert + post reduce` 的数据流。
+
+### 为什么同名 `aiter::fmoe...` kernel 在 `none` 下更慢？
+
+这个问题可以更具体一点回答。观察到的数字是：
+
+```text
+mori:
+  一组 prefill 60 个 aiter::fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_ps_32x512
+  平均大约 1.746 ms
+
+none:
+  一组 prefill 60 个同名 kernel
+  平均大约 2.303 ms
+```
+
+从 trace 抽出来的第一层 `aiter::fused_moe_` 输入 shape 是：
+
+```text
+mori:
+  hidden_states = [32768, 4096]
+  w13           = [128, 2048, 4096]
+  w2            = [128, 4096, 1024]
+  topk_ids      = [32768, 10]
+  topk_weights  = [32768, 10]
+  expert_mask   = [512]
+
+none:
+  hidden_states = [8000, 4096]
+  w13           = [129, 2048, 4096]
+  w2            = [129, 4096, 1024]
+  topk_ids      = [8000, 11]
+  topk_weights  = [8000, 11]
+  expert_mask   = [513]
+```
+
+所以虽然最后 GPU kernel 名字一样，但它们不是同一份 workload。
+
+最关键的差异是 shared expert：
+
+```text
+none:
+  Qwen shared expert 被 append 到 topk 里，routed top-k 10 变成 11。
+  本地 expert 从 128 个 routed expert 变成 128 + 1 = 129。
+  这个 shared expert 对每个 token 都有效。
+
+mori:
+  SGLang 把 Qwen shared expert fusion 关掉。
+  AITER fmoe 只算 routed experts，本地 expert 是 128，topk 是 10。
+  shared expert 走单独的 Qwen2MoeMLP，不在这个 aiter::fmoe... kernel 里。
+```
+
+代码证据在 Qwen MoE 里：
+
+```python
+# sglang/srt/models/qwen2_moe.py
+if (
+    self.enable_shared_expert_fusion
+    and uses_per_rank_fused_shared_slots()
+    and get_parallel().moe_ep_size > 1
+):
+    self.enable_shared_expert_fusion = False
+```
+
+`mori` 属于 `is_deepep_class_backend()`，所以在 EP size > 1 时会走这个分支，shared expert fusion 被关掉。
+
+而 `none` 不属于 DeepEP-class backend，所以会继续走：
+
+```python
+# sglang/srt/models/qwen2_moe.py
+if self.enable_shared_expert_fusion:
+    topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+```
+
+并且 `_append_shared_to_topk_output()` 会调用：
+
+```python
+fused_append_shared_experts_with_weights(
+    topk_output.topk_ids,
+    topk_output.topk_weights,
+    shared_weights,
+    self.num_fused_shared_experts,
+    N=self.num_experts,
+    apply_sigmoid=_use_aiter,
+    scale=shared_scale,
+)
+```
+
+这个 append 之后，`none` 的 AITER fused_moe 看到的 topk 维度就是 11。
+
+用一个粗略估算看，`none` 多出来的计算量也对得上你的 profile：
+
+```text
+T = 8000
+routed topk = 10
+EP size = 4
+
+none 每 rank routed token-expert pairs:
+  T * topk / EP = 8000 * 10 / 4 = 20000
+
+none 还 fused shared expert:
+  + T = +8000
+
+所以 none 本 rank fmoe 里大约:
+  20000 + 8000 = 28000 pairs
+
+如果没有 shared expert:
+  20000 pairs
+
+比例:
+  28000 / 20000 = 1.4x
+```
+
+你的实测 fmoe kernel 比例：
+
+```text
+2.303 / 1.746 ~= 1.325x
+```
+
+这个量级和“`none` 的 fmoe kernel 多融合了 shared expert”是匹配的。
+
+还有一个很重要的点：shared expert 不是均匀分散到 128 个 routed experts 上的普通 expert。它是一个“每个 token 都会走”的 dense expert：
+
+```text
+routed experts:
+  平均每个 local routed expert 大约拿 8000 * 10 / 512 ~= 156 个 token。
+
+shared expert:
+  一个 expert 直接拿 8000 个 token。
+```
+
+所以它不只是简单多了 10% topk。对当前 rank 的 routed MoE kernel 来说，shared expert 额外加了一个很重、很不均衡的 expert bucket。AITER sorting 后会把它作为一个本地 expert 组喂给 fmoe GEMM，因此 `none` 的同名 fmoe kernel 本身变长是合理的。
+
+这也说明：
+
+```text
+不能只按 kernel name 判断两边计算一样。
+
+同名 kernel:
+  aiter::fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_ps_32x512
+
+但是 none 的输入语义:
+  routed experts + fused shared expert
+
+mori 的输入语义:
+  routed experts only，shared expert 已经移到单独 MLP 路径
+```
+
+Mori trace 里也能看到 separate shared expert 的痕迹：`Qwen2MoeMLP` 每层会跑两次 FP8 GEMM 和一次 `silu_and_mul`，这些不算在 `aiter::fmoe_bf16_...` 这个 kernel 名下。所以如果只比较 fmoe kernel 本身，Mori 看起来更快，一部分原因是 shared expert compute 被移出了这个 kernel。
+
+最后再补一个容易误会的点：Mori 的 `hidden_states = [32768, 4096]` 比 `none` 的 `[8000, 4096]` 大，但这不是说 Mori 的 fmoe 对 32768 个 token 全量做了 10 个 expert 的 dense 计算。AITER fmoe 入口还拿了：
+
+```text
+sorted_token_ids
+sorted_weights
+sorted_expert_ids
+num_valid_ids
+```
+
+真正喂给 fmoe 的是 sorting 后的有效 token-expert tile。`[32768, 4096]` 更像 Mori dispatch/receive 的 capacity buffer；kernel name 和 launch grid 相同，也不能说明实际有效 tile 数相同。
 
 ### `--moe-a2a-backend mori` 的 moe_sorting
 
