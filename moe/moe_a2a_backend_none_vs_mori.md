@@ -204,7 +204,7 @@ moe_a2a_backend='none'
 6. combine 把 expert 输出送回原 token 所在位置，并按 topk_weights 加权求和
 ```
 
-从“学习 EP”的角度看，`mori` 模式就是：
+`mori` 模式就是：
 
 ```text
 router -> dispatch -> local experts -> combine
