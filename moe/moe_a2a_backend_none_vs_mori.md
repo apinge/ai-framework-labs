@@ -415,6 +415,125 @@ _append_shared_to_topk_output(...)
 
 并且注释里也写了 allreduce-EP path 下 shared expert 是 single global slot，每个 EP rank 都会算一份 shared output，然后靠 `1 / ep_size` scale 抵消后面的 all_reduce 重复求和。
 
+这里还要补一个关键点：`--moe-a2a-backend none` 不是在 dispatch 层先把 8000 个 token 过滤成“本 rank local experts 需要的 token”。从 SGLang 代码看，standard dispatcher 返回的仍然是完整：
+
+```text
+hidden_states: [8000, 4096]
+topk_ids/topk_weights: 原 token 顺序
+```
+
+也就是说，每个 EP rank 都把本 rank 的完整 prefill token batch 送进本地 MoE runner。区别在于 `none` 路径会为当前 rank 构造一个 `expert_mask_gpu`：
+
+```python
+# sglang/srt/layers/moe/token_dispatcher/standard.py
+local_expert_mapping = [-1, -1, ..., local_id, local_id, ..., -1]
+expert_mask_gpu = (local_expert_mapping >= 0) & (local_expert_mapping < num_local_experts)
+```
+
+如果当前用的是 AITER MoE runner，SGLang 不把 global `topk_ids` 改成 local id，而是把这个 `expert_mask_gpu` 传进 AITER：
+
+```python
+# sglang/srt/layers/moe/moe_runner/aiter.py
+fused_moe(
+    hidden_states=runner_input.hidden_states,
+    topk_weight=runner_input.topk_weights,
+    topk_ids=runner_input.topk_ids,
+    expert_mask=quant_info.expert_mask,
+)
+```
+
+AITER 里 `expert_mask` 的语义也很直接：
+
+```python
+# aiter/fused_moe.py
+valid_mask[t, k] = 1 if topk_ids[t, k] points to a local expert else 0
+```
+
+所以 `none` 路径的行为更准确地说是：
+
+```text
+每个 EP rank 都看到完整 M=8000 的 hidden_states
+每个 EP rank 只持有自己的 local expert weights，比如 128 routed + 1 shared
+topk_ids 仍然是 global expert id
+expert_mask 在 AITER sorting / fused_moe 内部筛掉非本 rank expert assignments
+本 rank 输出的是 [8000, hidden] 的 partial result
+MoE 后再 all_reduce，把不同 EP rank 算出的 partial result 加起来
+```
+
+因此你说“mask 不作用在这个层面”是对的：它不作用在 `StandardDispatcher.dispatch()` 的 tensor shape 层面，所以 trace 里还是 `[8000,4096]`。mask 作用在 AITER fused MoE 的 routing/sorting/GEMM/reduction 层面。
+
+但也不能理解成“每个 expert 都硬算 8000 个 token，然后最后才把结果 mask 掉”。更准确是：
+
+```text
+有全量 8000 token 的输入/排序/输出 buffer 成本；
+sorting 阶段用 expert_mask 先筛出 valid token-expert assignments；
+专家 GEMM 主要只对 sorted_ids / num_valid_ids 覆盖的 valid assignments 做有效计算；
+非本 rank expert 的 assignments 不贡献本 rank output；
+最后靠 all_reduce 汇总所有 rank 的 partial output。
+```
+
+AITER 代码里也是这个顺序：
+
+```text
+fused_moe(...)
+  -> moe_sorting(topk_ids, topk_weight, expert_mask, ...)
+       生成 sorted_ids / sorted_expert_ids / num_valid_ids
+  -> aiter.fmoe_g1u1(..., sorted_ids, sorted_expert_ids, num_valid_ids, ...)
+```
+
+所以 routed expert 部分不是“先算完再丢掉”，而是“先按 expert_mask/sorting 得到本 rank 有效的 token-expert rows，再让 fmoe kernel 用这些 rows 做专家 GEMM”。不过 `hidden_states` 本身还是 `[8000,4096]` 传进 kernel wrapper，某些路径的 activation quantization、`moe_buf=[8000,4096]` 输出 buffer，以及后面的 all_reduce 仍然有全量 M=8000 的成本。
+
+shared expert 是一个例外：`none` 路径 shared fusion 开启时，shared expert 被映射成所有 EP rank 都 valid 的 fused shared slot，所以每个 rank 都会对这 8000 个 token 算一份 shared expert output，然后用 `1 / ep_size` 缩放抵消后续 all_reduce 的重复求和。
+
+
+在 `--moe-a2a-backend none` 下，可以把每个 EP rank 的 MoE 输出理解成一个 partial output tensor：
+
+  rank0 output: [8000, 4096]
+  rank1 output: [8000, 4096]
+  rank2 output: [8000, 4096]
+  rank3 output: [8000, 4096]
+
+  每个 rank 的 [8000,4096] 里：
+
+  对于某个 token:
+    如果这个 token 的 top-k expert 里有 expert 属于本 rank:
+        本 rank 计算这些 local expert 的贡献，写到 output[token]
+    如果这个 token 的 top-k expert 都不属于本 rank:
+        本 rank 的 output[token] 基本就是 0 或无贡献
+
+  然后 MoE 后做：
+
+  all_reduce(sum)
+
+  把所有 rank 的 partial output 加起来：
+
+  final[token]
+  = rank0_partial[token]
+  + rank1_partial[token]
+  + rank2_partial[token]
+  + rank3_partial[token]
+
+  这样每个 token 的 top-k experts 分布在哪些 rank 上，就由哪些 rank 算对应的那部分贡献。all-reduce 之后，这个 token 的所有 expert contribution 都汇总回来了。
+
+  所以你的话可以改成更精确版本：
+
+  fused_moe 后每个 rank 都有一个 [8000,4096] partial output。
+  其中有些 token 在这个 rank 上有 local expert contribution，有些没有。
+  all_reduce 把所有 rank 的 partial output 相加。
+  最终每个 token 都拿到了它 top-k routed experts 的完整 MoE 输出。
+
+  再加上 shared expert：
+
+  如果 shared expert fusion 开启：
+    shared expert 每个 rank 都算一份
+    shared weight 预先乘 1 / ep_size
+    all_reduce 后不会重复放大
+
+这就是 none 路径“不搬 token 也能算对”的原因：它不靠 dispatch/combine 把 token 发到 expert owner，而是让所有 rank 都保留完整 token batch，各自只算自己拥有的 expert contribution，最后
+用 all-reduce 合并 partial output。
+
+这也解释了为什么 `none` 路径看起来直白但会慢：它省掉了 dispatch/combine 的 all-to-all token 搬运，但每个 EP rank 都保留完整 token batch，并且最后对 `[8000,4096]` 做 all_reduce；Mori/DeepEP 则把 token dispatch 到 expert owner，local expert kernel 的输入变成 dispatch 后的 expert-packed buffer，再 combine 回原 token owner。
+
 `mori` 路径里这个 rank 的形状大致是：
 
 ```text
