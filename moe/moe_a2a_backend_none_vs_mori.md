@@ -463,7 +463,7 @@ expert_mask 在 AITER sorting / fused_moe 内部筛掉非本 rank expert assignm
 MoE 后再 all_reduce，把不同 EP rank 算出的 partial result 加起来
 ```
 
-因此你说“mask 不作用在这个层面”是对的：它不作用在 `StandardDispatcher.dispatch()` 的 tensor shape 层面，所以 trace 里还是 `[8000,4096]`。mask 作用在 AITER fused MoE 的 routing/sorting/GEMM/reduction 层面。
+mask不作用在 `StandardDispatcher.dispatch()` 的 tensor shape 层面，所以 trace 里还是 `[8000,4096]`。mask 作用在 AITER fused MoE 的 routing/sorting/GEMM/reduction 层面。
 
 但也不能理解成“每个 expert 都硬算 8000 个 token，然后最后才把结果 mask 掉”。更准确是：
 
@@ -518,7 +518,7 @@ shared expert 是一个例外：`none` 路径 shared fusion 开启时，shared e
 
   这样每个 token 的 top-k experts 分布在哪些 rank 上，就由哪些 rank 算对应的那部分贡献。all-reduce 之后，这个 token 的所有 expert contribution 都汇总回来了。
 
-  所以你的话可以改成更精确版本：
+  所以可以改成更精确版本：
 
   fused_moe 后每个 rank 都有一个 [8000,4096] partial output。
   其中有些 token 在这个 rank 上有 local expert contribution，有些没有。
@@ -701,7 +701,7 @@ fused_append_shared_experts_with_weights(
 
 这个 append 之后，`none` 的 AITER fused_moe 看到的 topk 维度就是 11。
 
-用一个粗略估算看，`none` 多出来的计算量也对得上你的 profile：
+用一个粗略估算看，`none` 多出来的计算量也对得上 profile：
 
 ```text
 T = 8000
@@ -724,7 +724,7 @@ none 还 fused shared expert:
   28000 / 20000 = 1.4x
 ```
 
-你的实测 fmoe kernel 比例：
+实测 fmoe kernel 比例：
 
 ```text
 2.303 / 1.746 ~= 1.325x
