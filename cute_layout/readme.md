@@ -44,6 +44,17 @@ $$(2,(1,6)):(1,(6,2)) ;\longrightarrow; \text{shape}=(2,1,6),\ \text{stride}=(1,
 
 我们先把 mode1 那个1:6直接丢弃 剩下(2,6):(1,2)这个满足规则2，合并成为12:1
 
+### 第二个coalesce例子 
+layout (8,4,320):(1,128,512)
+
+mode1(4:128)和mode2(320:512)也满足 `stride[i] * shape[i] == stride[i+1]`,因为4*128=512
+
+简单的口诀 shape是 `shape[i]*shape[i+1]` stride是`stride[i]`
+
+(4,320):(128,512)=>4*320:128=1280:128
+
+最后结合mode0
+(8,1280):(1,128)
 ## left problems
  
 - Complement and Product
