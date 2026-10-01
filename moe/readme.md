@@ -1,5 +1,6 @@
 # moe 
 
+
 从头分析MOE (Top-k Sparse MoE + Shared Expert )的原理， 以 [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json)TP8 为例，介绍torch基本计算（torch reference），kernel算法优化，ROCM上各种量化的区别和联系 和在framework里的实现。
 
 ## 从数学理解到矩阵计算
