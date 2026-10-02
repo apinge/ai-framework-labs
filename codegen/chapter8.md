@@ -1392,7 +1392,7 @@ for (int i = 0; i < n; ++i)
 本轮：%iv_plus_1 = %iv + 1
 ```
 
-`%iv` 是当前迭代值，`%iv_plus_1` 是递增后的下一迭代值。书中的 loop 在每轮先加一、再比较，因此概念上接近：
+`%iv` 是当前迭代值，`%iv_plus_1` 是递增后的下一迭代值。书中的 loop 在每轮先加一、再比较。下面是一个与其中的 `icmp ult` 具有相同比较语义的**源级草图**：
 
 ```cpp
 uint64_t iv = 0;
@@ -1403,7 +1403,162 @@ do {
 } while (iv_plus_1 < upper_bound);
 ```
 
-注意原 IR 使用 `icmp ult`，即 unsigned comparison；普通 `add i64` 没有 `nsw`/`nuw`，保留 64-bit modulo arithmetic 语义。
+这里的 `uint64_t` 不是从 SSA 名称 `%iv` 或 `%upper_bound` 本身推导出来的。LLVM 的整数类型是 signless：
+
+```llvm
+%iv          ; 名称没有 signed/unsigned 信息
+i64          ; i64 只表示 64 个 bit，不表示 signed i64 或 unsigned i64
+```
+
+因此，不能只根据：
+
+```llvm
+%iv = phi i64 ...
+```
+
+断言源代码一定写了 `uint64_t`，也不能断言一定写了 `int64_t`。前端在降低 C/C++ 时会把 signed/unsigned 的**每次使用语义**编码到具体指令中。
+
+在本例中：
+
+```llvm
+%cond = icmp ult i64 %iv_plus_1, %upper_bound
+```
+
+`ult` 表示 unsigned less-than，因此仅能确定：这一处比较将两个 `i64` bit pattern 按无符号整数解释。它可能来自普通的：
+
+```cpp
+uint64_t iv_plus_1;
+uint64_t upper_bound;
+iv_plus_1 < upper_bound;
+```
+
+也可能来自 signed 值经过显式 cast 后的无符号比较。IR 已不保留“变量在源代码中声明时带的是 signed 还是 unsigned”这一全局标签。
+
+常见的 signed/unsigned 语义在 LLVM IR 中通过使用点表达：
+
+| 源级所需语义 | LLVM IR 例子 |
+| --- | --- |
+| 有符号比较 | `icmp slt i64 %a, %b` |
+| 无符号比较 | `icmp ult i64 %a, %b` |
+| 有符号除法 / 余数 | `sdiv` / `srem` |
+| 无符号除法 / 余数 | `udiv` / `urem` |
+| 有符号扩展 | `sext i32 %x to i64` |
+| 无符号扩展 | `zext i32 %x to i64` |
+| 算术右移 | `ashr` |
+| 逻辑右移 | `lshr` |
+| 有符号 / 无符号整数转浮点 | `sitofp` / `uitofp` |
+
+普通：
+
+```llvm
+%iv_plus_1 = add i64 %iv, 1
+```
+
+只计算 64-bit 的结果 bit pattern；它本身没有 signed 或 unsigned 加法版本。若源语义还要求“不发生有符号回绕”或“不发生无符号回绕”，前端或优化器可附加：
+
+```llvm
+add nsw i64 %iv, 1 ; signed no-wrap
+add nuw i64 %iv, 1 ; unsigned no-wrap
+```
+
+书中示例的 `add i64` 不带 `nsw` 或 `nuw`，所以不能从该 add 推断出 source-level signed overflow 的承诺；它按 64-bit modulo arithmetic 的 IR 语义工作。
+
+#### 用本机 `hipcc` 验证 source signedness 如何落入 AMDGPU IR
+
+为确认这不是只停留在规则层面的说法，我们用本机 ROCm `hipcc` 将两个最小 HIP C++ kernel 编译为 AMDGPU LLVM IR。两者的循环形状相同，唯一差别是 source type：
+
+```cpp
+extern "C" __global__
+void unsigned_loop(uint64_t *out, uint64_t bound) {
+  uint64_t iv = 0;
+  do {
+    iv = iv + 1;
+  } while (iv < bound);
+  out[0] = iv;
+}
+
+extern "C" __global__
+void signed_loop(int64_t *out, int64_t bound) {
+  int64_t iv = 0;
+  do {
+    iv = iv + 1;
+  } while (iv < bound);
+  out[0] = iv;
+}
+```
+
+使用等价于：
+
+```bash
+hipcc -x hip --offload-arch=gfx942 --cuda-device-only \
+  -O0 -S -emit-llvm source.hip -o output.ll
+```
+
+得到的关键 IR 为：
+
+```llvm
+; uint64_t 版本
+%next = add i64 %iv, 1
+%cond = icmp ult i64 %next, %bound
+```
+
+```llvm
+; int64_t 版本
+%next = add nsw i64 %iv, 1
+%cond = icmp slt i64 %next, %bound
+```
+
+这验证了三个结论：
+
+1. 两个 source type 都降低为 `i64`；
+2. unsigned/signed 比较分别落到 `ult`/`slt`；
+3. signed C++ 加法带 `nsw`，因为 signed overflow 在普通 C++ 语义下是 UB；unsigned 加法不带 `nuw`，因为无符号回绕是定义良好的行为。
+
+在 `-O1` 下，这两个小循环还会被进一步折叠为不同 intrinsic：
+
+```llvm
+; unsigned_loop
+%r = tail call i64 @llvm.umax.i64(i64 %bound, i64 1)
+
+; signed_loop
+%r = tail call i64 @llvm.smax.i64(i64 %bound, i64 1)
+```
+
+这再次说明 signedness 没有从优化中消失；它被保存在比较、算术 flag 和选择的 intrinsic 中，而非保存在 `%iv` 的静态类型里。
+
+### 为什么 LLVM 将整数设计为 signless
+
+这套设计起初容易让 C/C++ 开发者困惑，因为源语言中：
+
+```cpp
+int64_t
+uint64_t
+```
+
+是不同类型，影响比较、除法、右移和 overflow 行为。但 LLVM IR 处在比 C++ 更低的抽象层：`i64` 首先是一组 64 bit。
+
+例如同一 bit pattern：
+
+```text
+0xffffffffffffffff
+```
+
+既可按 signed `i64` 解释为 `-1`，也可按 unsigned `i64` 解释为 `18446744073709551615`。硬件寄存器通常没有“这个寄存器永远是 signed”的标签；许多操作，例如 `add`、`sub`、`and`、`or`、`xor`，对两种解释执行完全相同的 bit 运算。
+
+真正依赖解释方式的是具体操作。例如，同一个 `%x` 可以合理地同时参与：
+
+```llvm
+%is_negative = icmp slt i64 %x, 0
+%is_large = icmp ugt i64 %x, 100
+```
+
+若 `%x` 永久带一个 signed 或 unsigned 类型，第二种解释需要制造许多没有 bit 变化的类型转换；而 LLVM 只需让每条操作选择所需语义。
+
+这也减少了 IR type 和 rewrite rule 的重复。若存在独立的 `si64` 与 `ui64`，很多 bit-level 等价的操作都需要两套类型规则；signless `i64` 只在 signedness 真正影响结果时，通过 `slt`/`ult`、`sdiv`/`udiv`、`sext`/`zext`、`ashr`/`lshr`、`nsw`/`nuw` 等明确区分。
+
+我的判断是，这是一个合理的 IR 设计边界：前端负责将 C/C++ 类型系统和 overflow 规则分解为精确的操作级语义，middle end 和 backend 处理统一的 bit-vector 值。代价是读 IR 时不能把 `i64` 自动翻译成“有符号 long”或“无符号 long”，必须查看其 use。
+
+调试信息可能仍记录原始 C++ 声明类型，例如 DWARF 中的 signed/unsigned 编码；但它可以被剥离，也不作为优化器的语义依据。`!tbaa`、`!range` 等 metadata 可提供别名或范围事实，也不取代具体指令的 signed/unsigned 语义。
 
 ### 原始 IR 的 loop boundary 问题
 
@@ -1545,3 +1700,1383 @@ wave 0 写入 LDS
 ```
 
 对 loop counter、kernel 参数等计算便宜的 uniform 值，每个 wave 独立在自己的 SGPR 中重算通常更合适。
+
+# CGSCC 在inline里的作用
+
+
+先把函数调用关系画成有向图：
+
+```
+A -> B
+A -> C
+B -> D
+C -> D
+```
+
+箭头表示：
+
+```
+caller -> callee
+```
+
+这里没有递归，因此每个函数自己就是一个 SCC：
+
+```
+{A}, {B}, {C}, {D}
+```
+
+inliner 会先从叶子开始：
+
+```
+D
+↑
+B, C
+↑
+A
+```
+
+也就是先处理 `D`，再处理调用 `D` 的 `B` 和 `C`，最后才处理 `A`。
+
+这样做的直觉是：
+
+> 先让更底层的 callee 完成内联和优化，再判断它是否值得被上层 caller 内联。
+
+例如 `B` 先把 `D` 内联或优化后，`B` 的体积、常量信息、调用数量都会变化；之后判断是否把 `B` 内联进 `A` 会更准确。
+
+***
+
+“强连通”处理的是递归或互相递归。
+
+```
+foo -> bar
+ ^      |
+ |______|
+```
+
+从 `foo` 能到 `bar`，也从 `bar` 能回到 `foo`。因此：
+
+```
+{foo, bar}
+```
+
+是一个 CGSCC。
+
+它们不能被简单排成：
+
+```
+先 foo 后 bar
+```
+
+或：
+
+```
+先 bar 后 foo
+```
+
+因为两者互相依赖。LLVM 将它们视为一个整体区域来处理。
+
+自递归也是 SCC：
+
+```
+int fact(int n) {
+  return n <= 1 ? 1 : n * fact(n - 1);
+}
+```
+
+调用图：
+
+```
+fact -> fact
+```
+
+因此：
+
+```
+{fact}
+```
+
+是一个带自环的 CGSCC。
+
+***
+
+可以把调用图先压缩成“每个 SCC 一个节点”的 DAG：
+
+```
+原 call graph：
+
+A -> B -> D
+ \    \
+  -> C -> D
+
+压缩 SCC 后仍是 DAG：
+
+{A} -> {B} -> {D}
+  \      \
+   -> {C} -> {D}
+```
+
+若有递归：
+
+```
+main -> foo <-> bar -> helper
+```
+
+则压缩后：
+
+```
+{main} -> {foo, bar} -> {helper}
+```
+
+这时 inliner 的处理顺序接近：
+
+```
+{helper}
+    ↑
+{foo, bar}
+    ↑
+{main}
+```
+
+***
+
+书中这句话：
+
+> This particular inliner uses the regions formed by the call graph strongly connected component (CGSCC) to determine the order in which inline decisions are made, starting from the leaves of the call graph and moving up to their parents.
+
+可以翻成：
+
+> 这个 inliner 将调用图按强连通分量分组，以此决定内联决策顺序。它先处理调用图底部的 callee，再逐步处理调用它们的 caller；互相递归的一组函数作为一个整体处理。
+
+这里的 `region` 不是内存区域，而是：
+
+```
+调用图中一组互相可达的函数
+```
+
+也就是一个 CGSCC。
+
+## Induction Variables Simplification：为什么循环 IR 能变成 `umax`
+
+书中的 `IndVarSimplifyPass`（命令行名 `indvars`）专门处理 induction variable 及其派生值。它不一定删除整个 loop；它的目标是把“每轮更新 induction variable 才能得到的值”改写成更容易被其他优化使用的表达式。
+
+书中的输入 IR 是：
+
+```llvm
+define i64 @foo(i64 %src, i64 %ub) {
+entry:
+  br label %loop
+
+loop:
+  %iv = phi i64 [ 0, %entry ], [ %iv1, %loop ]
+  %iv1 = add i64 %iv, 1
+  %cond = icmp ult i64 %iv1, %ub
+  br i1 %cond, label %loop, label %end
+
+end:
+  %tmp = add i64 %iv1, %src
+  %res = add i64 %tmp, %iv1
+  ret i64 %res
+}
+```
+
+### 先看这个 loop 实际算了什么
+
+`%iv` 初始为 `0`。每轮：
+
+```text
+%iv1 = %iv + 1
+若 %iv1 <u %ub，继续下一轮
+否则离开 loop
+```
+
+`<u` 来自 `icmp ult`，所以比较是 unsigned。这个 loop 的退出值可直接列出来：
+
+| `%ub` | `%iv1` 依次取得的值 | 离开 loop 时的最终 `%iv1` |
+| --- | --- | --- |
+| `0` | `1` | `1` |
+| `1` | `1` | `1` |
+| `2` | `1, 2` | `2` |
+| `5` | `1, 2, 3, 4, 5` | `5` |
+
+因此最终值是：
+
+```text
+final_iv1 = unsigned_max(%ub, 1)
+```
+
+也就是 LLVM intrinsic：
+
+```llvm
+%umax = call i64 @llvm.umax.i64(i64 %ub, i64 1)
+```
+
+书中所谓 “loop trip count can be determined statically” 容易被理解为“编译期已经知道具体循环次数”。这里更准确的意思是：编译器可以从 induction variable、步长 `+1`、初值 `0` 和 exit condition 推导出一个**符号公式**。`%ub` 仍然是运行时参数，但最终 `%iv1` 可在不执行 loop 的情况下由 `%ub` 表示。
+
+用接近源代码的写法，原函数相当于：
+
+```cpp
+uint64_t foo(uint64_t src, uint64_t ub) {
+  uint64_t iv = 0;
+  uint64_t iv1;
+  do {
+    iv1 = iv + 1;
+    iv = iv1;
+  } while (iv1 < ub);
+
+  return iv1 + src + iv1;
+}
+```
+
+在该 loop 没有任何其他副作用时，可改成：
+
+```cpp
+uint64_t foo(uint64_t src, uint64_t ub) {
+  uint64_t final_iv1 = std::max(ub, uint64_t{1});
+  return final_iv1 + src + final_iv1;
+}
+```
+
+### 为什么变换后的 IR 中还留着一个假 loop
+
+书中展示的 IndVarSimplify 输出是：
+
+```llvm
+define i64 @foo(i64 %src, i64 %ub) {
+entry:
+  br label %loop
+
+loop:
+  br i1 false, label %loop, label %end
+
+end:
+  %umax = call i64 @llvm.umax.i64(i64 %ub, i64 1)
+  %tmp = add i64 %umax, %src
+  %res = add i64 %tmp, %umax
+  ret i64 %res
+}
+```
+
+`loop` 中的：
+
+```llvm
+br i1 false, label %loop, label %end
+```
+
+表示回边永远不走，控制流总是进入 `%end`。它是这个 pass 改写后的临时 CFG 形态：IndVarSimplify 已删除 loop 内所有有意义的计算，并将循环结果搬到 `%end`，但它不负责做所有死 block / CFG 清理。
+
+后续的 `SimplifyCFG`、DCE 或类似 pass 可以继续将它化简为：
+
+```llvm
+entry:
+  br label %end
+```
+
+甚至把不再需要的 `%loop` block 完全删除。LLVM pipeline 中常将这种职责拆给多个小 pass：一个 pass 专注数学和 induction-variable 推导，另一个 pass 专注 CFG 清理。
+
+### 为什么这个优化合法
+
+原 loop 唯一可观察到的效果是计算最终 `%iv1`：
+
+```text
+没有 load/store
+没有 call
+没有 volatile/atomic
+没有可能被外部观察的 side effect
+```
+
+因此，只要新表达式在所有合法输入上产生同样的 `%iv1`，就可以删除实际迭代。
+
+如果 loop body 有副作用，例如：
+
+```llvm
+call void @log_iteration(i64 %iv1)
+store i64 %iv1, ptr %p
+```
+
+则不能将 loop 简单替换为 `umax`，因为每轮执行本身已可被观察。IndVarSimplify 仍可能简化 induction variable 的形式，但不会以这种方式删除副作用。
+
+### `llvm.umax.i64` 不是普通外部函数调用
+
+```llvm
+%umax = call i64 @llvm.umax.i64(i64 %ub, i64 1)
+```
+
+文本写作 `call`，但 `llvm.umax.i64` 是 LLVM intrinsic。它表达 unsigned max 语义，后续可以被继续优化或由 backend lower 为 target 适合的 compare/select、max 指令或其他序列。
+
+这里使用 unsigned max 是由原始：
+
+```llvm
+icmp ult i64 %iv1, %ub
+```
+
+决定的。若 exit compare 是 signed `<`，相应的闭式表达和 intrinsic 会不同；不能机械地把任意 induction loop 都改写为 `umax`。
+
+### TargetLibraryInfo 与 TargetTransformInfo 的作用
+
+书中指出该 pass 使用两类 target-aware analysis：
+
+- `TargetLibraryInfo`：判断相关 library call 是否有副作用、是否可安全移除或改写；
+- `TargetTransformInfo`：比较原 loop 与新表达式在当前 target 上的成本，决定改写是否划算。
+
+所以这个 pass 不是只做数学恒等式证明。它先证明语义等价，再根据 target 的成本模型决定是否采用某种具体改写。
+
+对 x86 和 AMDGPU，这个 IR-level 证明相同；但 `llvm.umax.i64` 的 lowering 成本、寄存器压力和最终机器指令可以不同，因此 TTI 参与决策。
+
+## Loop Strength Reduction：将 `A[i]` 的地址计算改成适合 target 的形态
+
+书中的 `LoopStrengthReducePass`，命令行名为 `loop-reduce`。它处理的是 loop 内由 induction variable 驱动的地址计算。
+
+“strength reduction” 的一般含义是：用语义相同、硬件成本更低或更容易组合的计算替换原计算。例如：
+
+```text
+x * 2   ->   x << 1
+```
+
+但 Loop Strength Reduction 的重点通常不是普通算术本身，而是：
+
+```text
+数组元素的地址如何由 loop index 计算出来
+```
+
+### `A[i]` 在机器地址层面是什么意思
+
+假设 C/C++ 有：
+
+```cpp
+int64_t value = A[i];
+```
+
+源级的数组下标表达式是：
+
+```cpp
+A[i]
+```
+
+按 C/C++ 指针算术的语义，它等价于：
+
+```cpp
+*(A + i)
+```
+
+但机器内存按 byte 编址。若 `A` 是 `int64_t*`，一个元素占 8 bytes，因此实际访问地址是：
+
+```text
+address(A[i]) = base_address(A) + i * sizeof(int64_t)
+              = base_address(A) + i * 8
+```
+
+例如：
+
+```text
+A 的 base address = 0x1000
+i = 0  -> A[0] 位于 0x1000
+i = 1  -> A[1] 位于 0x1008
+i = 2  -> A[2] 位于 0x1010
+i = 3  -> A[3] 位于 0x1018
+```
+
+所以书中说每前进一个元素，地址会前进多个 bytes；这个 `* 8` 就是 addressing mode 中的 scaling factor。
+
+### 书中的输入 IR
+
+书中示例遍历 `%arg` 指向的 `i64` 数组：若在 index 小于 `%ub` 的范围中找到第一个非零元素，就返回其 index；若没有找到则返回 `-1`。
+
+核心 loop body 是：
+
+```llvm
+bb4:
+  %i5 = getelementptr inbounds i64, ptr %arg, i64 %idx
+  %i6 = load i64, ptr %i5
+  %i7 = icmp ne i64 %i6, 0
+  br i1 %i7, label %bb10, label %bb8
+```
+
+其中：
+
+```llvm
+%i5 = getelementptr inbounds i64, ptr %arg, i64 %idx
+```
+
+语义上是：
+
+```text
+%i5 = %arg + %idx * sizeof(i64)
+    = %arg + %idx * 8
+```
+
+`getelementptr` 在 LLVM IR 中保留“按 `i64` 元素索引”的抽象语义；后端最终仍需形成 byte address。
+
+### Loop Strength Reduction 后的 IR
+
+书中展示的相关改写是：
+
+```llvm
+bb4:
+  %0 = shl i64 %idx, 3
+  %scevgep = getelementptr i8, ptr %arg, i64 %0
+  %i6 = load i64, ptr %scevgep
+```
+
+逐项对应：
+
+```llvm
+%0 = shl i64 %idx, 3
+```
+
+表示：
+
+```text
+%0 = %idx << 3
+   = %idx * 8
+```
+
+随后：
+
+```llvm
+%scevgep = getelementptr i8, ptr %arg, i64 %0
+```
+
+因为 GEP 的元素类型现在是 `i8`，每个元素正好是 1 byte：
+
+```text
+%scevgep = %arg + %0 * sizeof(i8)
+          = %arg + %0 * 1
+          = %arg + %idx * 8
+```
+
+因此改写前后访问的地址完全一样：
+
+```text
+getelementptr i64, %arg, %idx
+==
+getelementptr i8, %arg, (%idx << 3)
+```
+
+### 为什么看起来多了指令，却可能更好
+
+表面上：
+
+```llvm
+getelementptr i64, ptr %arg, i64 %idx
+```
+
+是一条 IR 指令；改写后却有：
+
+```llvm
+shl
+getelementptr i8
+```
+
+因此不能只按 LLVM IR 指令数量判断成本。Loop Strength Reduction 的目的，是将地址表达式变成后端容易识别和匹配的形式。
+
+很多 target 的 load/store addressing mode 能直接处理类似：
+
+```text
+base + index * scale + constant_offset
+```
+
+其中 `scale` 常是 `1`、`2`、`4`、`8`。对于 `i64` 数组，`%idx << 3` 明确表达了 scale 为 8；后端可能把 shift、base add 和 load 合并进一条或少量目标指令，而不需要生成独立 multiply。
+
+书中称 shift 的 strength 比 multiply 低，是因为对于 2 的幂常量：
+
+```text
+idx * 8
+==
+idx << 3
+```
+
+shift 常更便宜，或更容易折叠到目标机寻址模式中。现代硬件上常量乘法有时也很便宜，因此这个 pass 不假设 shift 永远胜出；它通过 target 的成本与寻址能力决定具体形态。
+
+### 这个 pass 还可能做什么
+
+更一般地，LSR 可能将：
+
+```text
+base + i * stride
+```
+
+变为递推地址：
+
+```text
+p = base
+每轮：使用 p，然后 p = p + stride
+```
+
+或者将多个共享同一 induction variable 的地址表达式组合成可复用 base/offset 形式。书中这个例子选择显式 `shl + byte GEP`，并不表示所有 loop 都会改成指针递推。
+
+### 书中输出里其他变化的原因
+
+书中 Loop Strength Reduction 输出还出现：
+
+- `%idx.lcssa1 = phi ...`：将 loop 内 `%idx` 通过 LCSSA 形式导出，方便 exit block 使用；
+- `bb10split` 与 `bb4.bb10_crit_edge`：分裂 critical edge，让插入新的计算或 `phi` incoming value 更安全、更简单；
+- `getelementptr i8`：将 scaling factor 从 GEP 元素类型中取出，显式表示为 shift。
+
+这些变化是为 address-expression rewrite 和 SSA/CFG 维护服务，核心语义仍是“找到第一个非零 `i64` 元素并返回 index”。
+
+### TargetLoweringInfo 与 TTI 为什么参与
+
+书中指出这个 pass 使用：
+
+- `TargetLoweringInfo`：检查某种地址模式和相应操作在 target 上是否合法；
+- `TargetTransformInfo`：评估原始与新地址表达式的成本，决定改写是否划算。
+
+因此它需要一个实际 target triple。没有 target，pass 无法可靠判断：
+
+```text
+这个 target 支不支持 base + index * 8？
+应保留 element-scaled GEP，还是显式 shift？
+一次额外 add/shl 是否值得？
+```
+
+对 x86，典型寻址模式天然接近 `base + index * {1,2,4,8} + offset`。对 AMDGPU，global/LDS/private address space 以及 scalar/vector address 的 lowering 规则不同；LSR 仍会尝试产生适合后续 AMDGPU codegen 的地址计算形态，但最终是否融合为特定 ISA 指令取决于 subtarget、address space、uniformity 和后端选择。
+
+### 实操结论
+
+读 `A[i]` 时，应先把它翻译为：
+
+```text
+base + index * element_size
+```
+
+Loop Strength Reduction 的工作不是改变访问哪个元素，而是改变这条 byte address 计算在 IR 中的表达方式，让后续 target-specific codegen 能选择更高效的寻址模式。
+
+## Loop Unrolling：复制循环体，用更少的迭代完成同样工作
+
+书中的 `LoopUnrollPass`，命令行名为 `loop-unroll`。loop unrolling 的含义是：将原 loop body 复制多份，使新 loop 的每一轮完成原 loop 的多轮工作。
+
+原始概念代码：
+
+```cpp
+for (int i = 0; i < n; ++i)
+  body(i);
+```
+
+若 unroll factor 是 2，概念上可变成：
+
+```cpp
+int i = 0;
+for (; i + 1 < n; i += 2) {
+  body(i);
+  body(i + 1);
+}
+if (i < n)
+  body(i);  // 处理奇数个元素留下的 remainder
+```
+
+新 loop 的每轮做两次原 body，循环控制、branch 和 induction-variable update 的次数大约减半。
+
+### 书中的输入：在前三个元素中找第一个非零值
+
+书中将之前“查找数组第一个非零元素”的上界固定为常量 `3`：
+
+```llvm
+bb3:
+  %idx = phi i64 [ 0, %bb ], [ %i9, %bb8 ]
+  %i = icmp slt i64 %idx, 3
+  br i1 %i, label %bb4, label %bb10
+
+bb4:
+  %i5 = getelementptr inbounds i64, ptr %arg, i64 %idx
+  %i6 = load i64, ptr %i5
+  %i7 = icmp ne i64 %i6, 0
+  br i1 %i7, label %bb10, label %bb8
+
+bb8:
+  %i9 = add nsw i64 %idx, 1
+  br label %bb3
+```
+
+源级意图接近：
+
+```cpp
+int64_t foo(const int64_t *arg) {
+  for (int64_t idx = 0; idx < 3; ++idx) {
+    if (arg[idx] != 0)
+      return idx;
+  }
+  return -1;
+}
+```
+
+因为 trip count 已知为 3，unroller 可以做 full unroll：不保留实际循环，直接写出三次访问和检查。
+
+概念上，结果变成：
+
+```cpp
+int64_t foo(const int64_t *arg) {
+  if (arg[0] != 0)
+    return 0;
+  if (arg[1] != 0)
+    return 1;
+  if (arg[2] != 0)
+    return 2;
+  return -1;
+}
+```
+
+这仍严格保留原来“返回**第一个**非零元素 index”的顺序。
+
+### 书中输出为什么有 `bb4.1`、`bb4.2` 和 `phi`
+
+书中输出的片段类似：
+
+```llvm
+bb4:
+  %i6 = load i64, ptr %arg
+  %i7 = icmp ne i64 %i6, 0
+  br i1 %i7, label %bb10, label %bb8
+
+bb4.1:
+  %i5.1 = getelementptr inbounds i64, ptr %arg, i64 1
+  %i6.1 = load i64, ptr %i5.1
+  %i7.1 = icmp ne i64 %i6.1, 0
+  br i1 %i7.1, label %bb10, label %bb8.1
+```
+
+`bb4` 是原 body 的第 0 次展开，`bb4.1` 是第 1 次展开，后面还有对应第 2 次展开的 block。每个 block 都检查各自固定 index 的元素：
+
+```text
+bb4    -> arg[0]
+bb4.1  -> arg[1]
+bb4.2  -> arg[2]
+```
+
+任何一次发现非零元素，都直接跳到 `%bb10`。因为 `%bb10` 现在可能从多个展开副本进入，它需要 `phi` 记录究竟命中了哪个 index：
+
+```llvm
+bb10:
+  %res = phi i64 [ 0, %bb4 ],
+                  [ 1, %bb4.1 ],
+                  [ 2, %bb4.2 ],
+                  [ -1, %no_match_path ]
+  ret i64 %res
+```
+
+它等价于：
+
+```text
+若从第 0 次检查命中，返回 0
+若从第 1 次检查命中，返回 1
+若从第 2 次检查命中，返回 2
+若全都未命中，返回 -1
+```
+
+书中完整输出里的 `.3` block、`unreachable` 和额外 CFG block 是 unroller 为保持循环 exit/边界条件语义产生的中间结构。后续 `SimplifyCFG`、DCE 等 pass 往往还能进一步清理它们；理解 full unroll 的重点是“原 loop body 被按每个已知 index 展开”，而不是 block 名称本身。
+
+### full unroll 与 partial unroll
+
+| 形式 | 条件 | 结果 |
+| --- | --- | --- |
+| Partial unroll | trip count 未知、过大，或不值得完全复制 | 复制 body 若干份，仍保留 loop 和 remainder handling。 |
+| Full unroll | trip count 很小且已知，或成本模型认为可接受 | 删除 loop，写成有限个 straight-line / branch block。 |
+
+若 trip count 是常量 3，full unroll 很自然。若 trip count 是运行时 `n`，通常只能 partial unroll，除非分析能证明更强的范围信息。
+
+### 为什么 unrolling 可能更快
+
+unrolling 的直接收益包括：
+
+- 减少 loop branch、比较和 induction-variable update；
+- 让相邻迭代的 load、算术和 store 同时出现在更大的 basic block 中；
+- 暴露更多 instruction-level parallelism，帮助 scheduler 重排独立操作；
+- 暴露连续内存访问和多个相似算术操作，帮助后续 vectorizer；
+- 让常量 index、constant GEP offset、dead branch 等进一步折叠。
+
+它不是 vectorization：unrolling 只是复制标量 loop body。vectorizer 若随后把多份标量操作合成一个 vector operation，才是 SIMD/vectorization。
+
+### 为什么不能无限展开
+
+复制代码也有成本：
+
+- machine code 变大，增加 I-cache 压力；
+- 更多同时存活的值可能增加寄存器压力；
+- 更多 register spill 可能反而变慢；
+- compile time 增加；
+- 对含复杂控制流、调用或异常处理的 loop，展开收益可能很低。
+
+AMDGPU 上尤其要关注 VGPR 使用量。过度 unroll 会让一个 work-item 同时保留更多值，增加 VGPR pressure；若超过某个资源阈值，wave occupancy 可能下降，最终比保留 loop 更慢。
+
+### TTI 如何参与决策
+
+书中指出 `LoopUnrollPass` 使用 `TargetTransformInfo` 估计 unroll 成本并决定 factor。target 还可通过：
+
+```cpp
+TargetTransformInfo::getUnrollingPreferences
+```
+
+调整阈值与偏好。
+
+因此，不存在一个对所有 target 都正确的 “unroll factor = 4” 或 “一定 full unroll” 规则：
+
+```text
+x86：可能考虑 branch 成本、SIMD 宽度、I-cache、寄存器数量
+AMDGPU：还会考虑 VGPR/SGPR pressure、occupancy、wave 执行和访存隐藏延迟
+```
+
+Loop unrolling 的正确性由原 loop 的控制流、trip count、依赖和副作用保证；TTI 主要决定这样做在当前 target 上是否值得。
+
+### `phi` 中的 `%i9` 为何可以在文本后面定义
+
+书中未展开前的 loop header 包含：
+
+```llvm
+bb3:
+  %idx = phi i64 [ 0, %bb ], [ %i9, %bb8 ]
+  %i = icmp slt i64 %idx, 3
+  br i1 %i, label %bb4, label %bb10
+```
+
+而 `%i9` 在文本后面的 loop latch block 中定义：
+
+```llvm
+bb8:
+  %i9 = add nsw i64 %idx, 1
+  br label %bb3
+```
+
+这不是“先声明 `%i9`、以后再赋值”，也不是未定义值。LLVM IR 中 `phi` 的每个 incoming pair：
+
+```llvm
+[ value, predecessor ]
+```
+
+应读作：
+
+```text
+若控制流从 predecessor 进入当前 block，
+则 phi 的结果取 value。
+```
+
+因此：
+
+```llvm
+%idx = phi i64 [ 0, %bb ], [ %i9, %bb8 ]
+```
+
+表示：
+
+```text
+从 %bb  进入 %bb3：%idx = 0
+从 %bb8 进入 %bb3：%idx = %i9
+```
+
+第一次进入 loop 时，控制流为：
+
+```text
+%bb -> %bb3
+```
+
+所以：
+
+```text
+%idx = 0
+```
+
+随后执行 loop body，并到达 `%bb8`：
+
+```text
+%bb3 -> %bb4 -> %bb8
+%i9 = %idx + 1
+%bb8 -> %bb3
+```
+
+第二次进入 `%bb3` 时，实际 predecessor 已经是 `%bb8`，而 `%i9` 已在 `%bb8` 中算出：
+
+```text
+第一次：%idx = 0
+          %i9 = 0 + 1
+
+第二次：%idx = %i9 = 1
+          %i9 = 1 + 1
+
+第三次：%idx = %i9 = 2
+```
+
+### 文本顺序不等于 SSA 定义顺序
+
+LLVM parser 允许 forward reference，所以 `%i9` 可以在文本中先被写进 `phi`，再在后面的 `%bb8` 定义。IR 是否合法由 CFG 和 SSA 规则决定，而不是单纯由文本行号决定。
+
+普通 SSA use 需要 definition 支配 use。但 `phi` 是特殊情况：它的 incoming value 被视为在对应 predecessor edge 上使用。因此：
+
+```llvm
+[ %i9, %bb8 ]
+```
+
+合法的条件是：
+
+```text
+%bb8 是 %bb3 的实际 predecessor
+%i9 在 %bb8 跳到 %bb3 前已经定义
+```
+
+这正是当前 IR 所满足的关系。
+
+以下情形则会非法：
+
+```text
+整个函数中根本没有定义 %i9
+  -> parser / verifier：use of undefined value
+
+%bb8 不是 %bb3 的 predecessor
+  -> verifier：phi incoming block 与 CFG 不匹配
+
+%i9 不能在 %bb8 -> %bb3 这条 edge 上保证有效
+  -> verifier：违反 phi 的 SSA/dominance 规则
+```
+
+所以阅读 `phi` 时，先看 `[value, predecessor]` pair 和 CFG edge；不要按文字中 value 定义出现的先后顺序判断它是否已定义。
+
+## Load/Store Vectorizer：`<2 x i64>`、`extractelement` 与 lane index
+
+书中 LoadStoreVectorizer 的输入是两个相邻 `i64` load 与两个相邻 `i64` store：
+
+```llvm
+define void @bar(ptr %src, ptr %dst) {
+  %v0 = load i64, ptr %src
+  %src1 = getelementptr i64, ptr %src, i64 1
+  %v1 = load i64, ptr %src1
+  store i64 %v0, ptr %dst
+  %dst1 = getelementptr i64, ptr %dst, i64 1
+  store i64 %v1, ptr %dst1
+  ret void
+}
+```
+
+它的源级意图接近：
+
+```cpp
+dst[0] = src[0];
+dst[1] = src[1];
+```
+
+因为元素是 `i64`，两个连续元素占：
+
+```text
+2 * 8 bytes = 16 bytes = 128 bits
+```
+
+vectorizer 将两次连续 load 合并为：
+
+```llvm
+%1 = load <2 x i64>, ptr %src
+```
+
+`<2 x i64>` 的含义是：
+
+```text
+一个 vector value
+├─ lane 0：一个 i64，对应 src[0]
+└─ lane 1：一个 i64，对应 src[1]
+```
+
+它不是“两个 `i64` 放进一个 `i32`”。这个 vector 总宽度是：
+
+```text
+2 lanes * 64 bits/lane = 128 bits
+```
+
+### `extractelement` 中的 `i32 0` 是索引，不是元素类型
+
+书中的优化后 IR 有：
+
+```llvm
+%v01 = extractelement <2 x i64> %1, i32 0
+%v12 = extractelement <2 x i64> %1, i32 1
+```
+
+`extractelement` 的一般形态是：
+
+```llvm
+%scalar = extractelement <N x element_type> %vector, integer %lane_index
+```
+
+所以第一条应读作：
+
+```text
+从 %1 这个 <2 x i64> vector 中，
+取 lane 编号 0，
+结果赋给 %v01。
+```
+
+类型关系是：
+
+```text
+%1    : <2 x i64>
+i32 0 : lane index 的整数常量
+%v01 : i64
+```
+
+也就是说，`i32 0` 只是“取第 0 个元素”的下标，类似 C++ 的：
+
+```cpp
+v[0]
+```
+
+它并不表示 `%v01` 是 `i32`，也不表示向量只能存一个 `i32`。
+
+对应关系为：
+
+```text
+%1 = <i64 src[0], i64 src[1]>
+
+extractelement %1, 0  ->  i64 src[0]
+extractelement %1, 1  ->  i64 src[1]
+```
+
+### 为什么又 `insertelement` 回去
+
+书中接着有：
+
+```llvm
+%2 = insertelement <2 x i64> poison, i64 %v01, i32 0
+%3 = insertelement <2 x i64> %2, i64 %v12, i32 1
+store <2 x i64> %3, ptr %dst
+```
+
+`insertelement` 的操作数顺序固定是：
+
+```llvm
+%result = insertelement <vector-type> %old_vector,
+                         <element-type> %new_element,
+                         <integer-type> %lane_index
+```
+
+因此第一条：
+
+```llvm
+%2 = insertelement <2 x i64> poison, i64 %v01, i32 0
+```
+
+每个部分的角色是：
+
+| 片段 | 含义 |
+| --- | --- |
+| `<2 x i64>` | 结果和第一个操作数都是两个 `i64` lane 的 vector。 |
+| `poison` | 初始 vector；概念上它的两个 lane 都尚未有可安全使用的值。 |
+| `i64 %v01` | 要写入某个 lane 的 scalar 元素，类型必须正好是 vector element type `i64`。 |
+| `i32 0` | lane index；表示覆盖 lane 0。它只是索引，类型 `i32` 与 lane 内数据宽度无关。 |
+
+所以第一条的逐 lane 效果是：
+
+```text
+初始 poison vector：< poison, poison >
+在 index 0 插入 %v01：%2 = < %v01, poison >
+```
+
+第二条：
+
+```llvm
+%3 = insertelement <2 x i64> %2, i64 %v12, i32 1
+```
+
+以 `%2` 作为旧 vector，保留 `%2` 的所有 lane，只覆盖 index 1：
+
+```text
+%2 的 lane 0 保留：%v01
+%2 的 lane 1 被覆盖：%v12
+
+%3 = < %v01, %v12 >
+```
+
+因此 `%3` **确实依赖 `%2`**。若第二条又从 `poison` 开始：
+
+```llvm
+; 错误的构造方式：会丢失 lane 0
+%3 = insertelement <2 x i64> poison, i64 %v12, i32 1
+```
+
+那么结果会是：
+
+```text
+< poison, %v12 >
+```
+
+而不是需要的：
+
+```text
+< %v01, %v12 >
+```
+
+`poison` 在这里不是一块已分配但未初始化的内存，也不是“随机数”。它是 LLVM IR 的特殊值，表示该 lane 在被安全地使用前没有有效语义。`insertelement` 的规则是：结果继承旧 vector 的所有 lane，只在指定 index 用新 scalar 覆盖。因此，从 `poison` vector 开始、逐个插入所有 lane，是构造完整 vector 的标准写法。
+
+本例中：
+
+```text
+%2：lane 1 仍为 poison，但 %2 只作为下一条 insertelement 的输入
+%3：lane 0、lane 1 都已被有效 i64 覆盖
+```
+
+所以 `%3` 可以安全地作为完整 `<2 x i64>` value 写入 `%dst`。若只构造了 `< %v01, poison >` 就把它当作一个已定义的完整 vector 使用，poison 会传播；store 本身可以保存 poison，但后续读取/控制流等使用不会得到一个可依赖的已定义 lane 值，也无法实现这里应有的数组复制语义。
+
+因为两个 lane 最终都已填入有效 `i64`，所以：
+
+```text
+%3 = < src[0], src[1] >
+```
+
+最终：
+
+```llvm
+store <2 x i64> %3, ptr %dst
+```
+
+一次写入两个连续 `i64`：
+
+```text
+dst[0] = src[0]
+dst[1] = src[1]
+```
+
+在这个被裁剪的简单示例中，`extractelement` 再 `insertelement` 的结果实际上重建了原 vector `%1`。后续 InstCombine 有机会继续看出：
+
+```text
+%3 == %1
+```
+
+并把它简化为：
+
+```llvm
+%1 = load <2 x i64>, ptr %src
+store <2 x i64> %1, ptr %dst
+```
+
+vectorizer 产生显式 extract/insert 的原因是它需要保留 lane 与原 scalar load/store 的映射，并适用于更一般的情形：中间 lane 可能被计算、重排、掩码选择或与其他 scalar value 组合。后续 canonicalization pass 可再清理在简单场景中变得冗余的构造。
+
+## Loop Vectorizer：一轮处理八个数组元素
+
+`LoopVectorizePass`，命令行名 `loop-vectorize`，与前面的 Load/Store Vectorizer 和 SLP Vectorizer 不同：它沿着 loop 的 induction variable，将**不同迭代**中的标量操作合并成一次 vector 操作。
+
+书中的输入 loop 核心是：
+
+```llvm
+bb3:
+  %idx = phi i64 [ 0, %bb ], [ %i14, %bb4 ]
+  %i = icmp ne i64 %idx, 24
+  br i1 %i, label %bb4, label %bb15
+
+bb4:
+  %i5 = getelementptr inbounds i16, ptr %arg1, i64 %idx
+  %i6 = load i16, ptr %i5
+  %i7 = sext i16 %i6 to i32
+  %i8 = getelementptr inbounds i16, ptr %arg2, i64 %idx
+  %i9 = load i16, ptr %i8
+  %i10 = sext i16 %i9 to i32
+  %i11 = add nsw i32 %i7, %i10
+  %i12 = trunc i32 %i11 to i16
+  %i13 = getelementptr inbounds i16, ptr %arg, i64 %idx
+  store i16 %i12, ptr %i13
+  %i14 = add nsw i64 %idx, 1
+  br label %bb3
+```
+
+源级意图近似：
+
+```cpp
+for (int64_t i = 0; i != 24; ++i) {
+  int32_t sum = int32_t(arg1[i]) + int32_t(arg2[i]);
+  arg[i] = int16_t(sum);
+}
+```
+
+也就是：
+
+```text
+arg[i] = arg1[i] + arg2[i]，共处理 24 个 i16 元素
+```
+
+### vectorized loop 的主要部分
+
+书中 vectorizer 生成：
+
+```llvm
+vector.body:
+  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]
+  %0 = add i64 %index, 0
+
+  %1 = getelementptr inbounds i16, ptr %arg1, i64 %0
+  %2 = getelementptr inbounds i16, ptr %1, i32 0
+  %wide.load = load <8 x i16>, ptr %2
+
+  %3 = getelementptr inbounds i16, ptr %arg2, i64 %0
+  %4 = getelementptr inbounds i16, ptr %3, i32 0
+  %wide.load1 = load <8 x i16>, ptr %4
+
+  %5 = add <8 x i16> %wide.load, %wide.load1
+
+  %6 = getelementptr inbounds i16, ptr %arg, i64 %0
+  %7 = getelementptr inbounds i16, ptr %6, i32 0
+  store <8 x i16> %5, ptr %7
+
+  %index.next = add nuw i64 %index, 8
+  %8 = icmp eq i64 %index.next, 24
+  br i1 %8, label %middle.block, label %vector.body
+```
+
+`<8 x i16>` 表示八个 16-bit lane：
+
+```text
+8 lanes * 16 bits = 128 bits = 16 bytes
+```
+
+第一轮 `%index = 0` 时：
+
+```text
+%wide.load  = < arg1[0], arg1[1], ..., arg1[7] >
+%wide.load1 = < arg2[0], arg2[1], ..., arg2[7] >
+
+%5 = < arg1[0] + arg2[0],
+       arg1[1] + arg2[1],
+       ...,
+       arg1[7] + arg2[7] >
+```
+
+然后一次 vector store 写入：
+
+```text
+arg[0] 到 arg[7]
+```
+
+第二轮 `%index = 8` 时处理：
+
+```text
+arg[8] 到 arg[15]
+```
+
+第三轮 `%index = 16` 时处理：
+
+```text
+arg[16] 到 arg[23]
+```
+
+因此：
+
+```text
+原 loop：24 次标量迭代，每轮处理 1 个元素
+vector loop：3 次向量迭代，每轮处理 8 个元素
+```
+
+### 为什么 `%index.next` 加 8
+
+标量 loop 中：
+
+```llvm
+%i14 = add nsw i64 %idx, 1
+```
+
+每轮前进一个元素。vectorized loop 每轮已处理 8 个元素，因此：
+
+```llvm
+%index.next = add nuw i64 %index, 8
+```
+
+这里的 `nuw` 表达：在该 loop 的已知范围中，`%index + 8` 不会发生 unsigned wrap。索引依次为：
+
+```text
+0 -> 8 -> 16 -> 24
+```
+
+因为 `24` 恰好能被 vector width `8` 整除，比较：
+
+```llvm
+icmp eq i64 %index.next, 24
+```
+
+在第三轮后为 true，vector loop 退出，不需要处理 scalar remainder。
+
+若 trip count 不是 8 的整数倍，例如 26，vectorizer 通常生成：
+
+```text
+vector loop：处理 0..23
+scalar remainder loop：处理 24..25
+```
+
+`vector.ph`、`middle.block` 等 block 就是这种 vector loop、退出和可能的 remainder loop 之间的通用 CFG 脚手架。书中输出被裁剪，未展示全部部分。
+
+### 为什么 scalar 的 `sext + add i32 + trunc` 变为 `add <8 x i16>`
+
+原标量计算是：
+
+```llvm
+%i7 = sext i16 %i6 to i32
+%i10 = sext i16 %i9 to i32
+%i11 = add nsw i32 %i7, %i10
+%i12 = trunc i32 %i11 to i16
+```
+
+`sext` 把两个 `i16` 的 signed 值扩展到 `i32` 后相加；最后 `trunc` 只保存结果低 16 bit。两个 signed `i16` 的和范围在：
+
+```text
+-65536 到 65534
+```
+
+不会让 `i32` 溢出，因此这里的 `nsw` 不会改变合法结果。最终只写低 16 bit 时，结果 bit pattern 与直接做 16-bit 加法相同：
+
+```llvm
+%5 = add <8 x i16> %wide.load, %wide.load1
+```
+
+该 vector add 是逐 lane 的：
+
+```text
+lane k 的结果 = arg1[index + k] + arg2[index + k]
+```
+
+这不是把八个值相加为一个值，也不是 reduction。
+
+### `%0 = add %index, 0` 与两层 GEP 为什么看似多余
+
+书中输出有：
+
+```llvm
+%0 = add i64 %index, 0
+%1 = getelementptr inbounds i16, ptr %arg1, i64 %0
+%2 = getelementptr inbounds i16, ptr %1, i32 0
+```
+
+在该裁剪示例中：
+
+```text
+%0 等于 %index
+GEP ..., 0 等于原地址
+```
+
+它们看起来可以删掉。vectorizer 常先生成统一的 vector loop 地址/CFG 形态，以便处理更复杂的 offset、runtime alias check、alignment、remainder 与 predication 情况；后续 InstCombine、SimplifyCFG 等 pass 可继续清理本例中变成 identity 的操作。
+
+因此，vectorizer 输出不一定是最终最精简 IR，而是后续优化 pipeline 的输入。
+
+#### 逐条解读 `%1` 和 `%2` 两次 GEP
+
+书中的代码是：
+
+```llvm
+%1 = getelementptr inbounds i16, ptr %arg1, i64 %0
+%2 = getelementptr inbounds i16, ptr %1, i32 0
+%wide.load = load <8 x i16>, ptr %2
+```
+
+第一条：
+
+```llvm
+%1 = getelementptr inbounds i16, ptr %arg1, i64 %0
+```
+
+应按 byte address 读作：
+
+```text
+%1 = address(%arg1) + %0 * sizeof(i16)
+   = address(%arg1) + %0 * 2 bytes
+```
+
+其中：
+
+```text
+i16  是 GEP 的元素类型，决定每个 index 单位的 stride 为 2 bytes
+i64  是 index operand %0 的整数类型，不能当作乘数或 element size
+```
+
+因此，若第一轮：
+
+```text
+%0 = %index = 0
+```
+
+则：
+
+```text
+%1 = %arg1 + 0 * 2 = %arg1
+```
+
+第二轮：
+
+```text
+%0 = %index = 8
+```
+
+则：
+
+```text
+%1 = %arg1 + 8 * 2 bytes
+   = &arg1[8]
+```
+
+第二条：
+
+```llvm
+%2 = getelementptr inbounds i16, ptr %1, i32 0
+```
+
+是：
+
+```text
+%2 = address(%1) + 0 * sizeof(i16)
+   = address(%1)
+```
+
+所以在当前示例中 `%2` 与 `%1` 指向同一个地址：
+
+```text
+%2 == %1 == &arg1[index]
+```
+
+它不是 load，也不会从 `%1` 所指向的内存读取一个指针；GEP 只计算地址。由于 LLVM 使用 opaque pointer，`%1` 和 `%2` 的静态类型都只是 `ptr`，GEP 的第一个类型参数 `i16` 提供“按 i16 元素跨度进行地址计算”的信息。
+
+随后：
+
+```llvm
+%wide.load = load <8 x i16>, ptr %2
+```
+
+从这个相同起始地址读取八个连续 `i16`：
+
+```text
+< arg1[index + 0], arg1[index + 1], ..., arg1[index + 7] >
+```
+
+`inbounds` 不会做运行时 bounds check；它是前端/vectorizer 对 LLVM 作出的保证，表示这些地址计算位于同一个分配对象的有效范围内。若该承诺在执行时不成立，结果会成为 poison。这里它表达 vectorized load 仍然访问原标量 loop 已合法访问的数组范围。
+
+第二个零偏移 GEP 是 vectorizer 统一生成地址形式留下的中间 identity。在更复杂的 vector loop 中，这个位置可能承载 lane offset、runtime alignment、masked/remainder access 等处理；对当前常量零偏移案例，后续 InstCombine 可以将 `%2` 替换为 `%1`。
+
+### `noalias` 为什么重要
+
+函数参数写作：
+
+```llvm
+define void @foo(ptr noalias %arg,
+                 ptr noalias %arg1,
+                 ptr noalias %arg2)
+```
+
+`noalias` 表示在该函数调用范围内，这些 pointer 所访问的对象不重叠。它帮助 vectorizer证明：写入 `arg[i]` 不会修改未来将从 `arg1[i+1]` 或 `arg2[i+1]` 读取的数据。
+
+若 `arg`、`arg1`、`arg2` 可能 alias，标量 loop 的严格逐次执行顺序可能可观察，vectorizer 必须进行 runtime alias check、选择更保守策略，或放弃向量化。
+
+### x86/AArch64 与 AMDGPU 的区别
+
+书中 target triple 是 AArch64；`<8 x i16>` 是 128-bit，适合该 target 的 SIMD 宽度。Loop vectorizer 通过 TargetLibraryInfo、TTI 和 TargetLowering 检查这种 vector type 与 memory operation 是否合适。
+
+在 AMDGPU 上，LLVM vector value 仍表示**一个 work-item 内**的八个 lane，不是八个 GPU thread。AMDGPU 已通过 wavefront 并行执行多个 work-item；对某个 loop 再做 loop vectorization 是否有收益，需要 AMDGPU 的 TTI 权衡寄存器压力、VGPR 使用、memory access、address space 和 subtarget 特性。后端也可能将 `<8 x i16>` 分解为多个操作，而非一条 128-bit vector ALU 指令。
+
+### 为什么合并连续访问有价值
+
+输入有四次标量内存指令：
+
+```text
+load src[0]
+load src[1]
+store dst[0]
+store dst[1]
+```
+
+优化后在 IR 层的关键内存操作是：
+
+```text
+load  <2 x i64> src
+store <2 x i64> dst
+```
+
+若 target 支持这种 128-bit vector memory operation，后端可以减少指令数和 memory-system 请求次数，或至少以更适合硬件的成组访问方式生成代码。
+
+这不是无条件保证。`TargetTransformInfo` 会检查 target 支持哪些 vector type；若目标无法高效处理 `<2 x i64>`，后端仍可能拆回多个 scalar memory access。
+
+在 x86/AArch64 上，向量 load/store 往往映射到 SIMD 寄存器和宽内存操作。对 AMDGPU，这个 `<2 x i64>` 是单个 work-item 中的两个 vector lane，不是两个 GPU thread；global、LDS/private address space、alignment、uniformity 和具体 subtarget 决定后端能否或应否将它合并为某种 AMDGPU memory instruction。
